@@ -1,0 +1,17 @@
+{
+  "name": "bct-chat-remote",
+  "owner": {
+    "name": "yoros"
+  },
+  "metadata": {
+    "description": "BCT group-chat remote participant kit.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "bct-chat-remote",
+      "source": "./",
+      "description": "Remote/external participation in BCT's group chat: python client + skill + SessionStart auto-join hook."
+    }
+  ]
+}
