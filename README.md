@@ -30,6 +30,27 @@ Host myhost
 
 The socket exists on the remote **only while an ssh session is up**.
 
+### Windows remote hosts
+
+Windows can't take the unix-socket forward (CPython lacks `AF_UNIX`, and
+`ssh -R` can't express `C:\` paths). Forward a **TCP port** instead — same
+ssh security model; the listener binds to the remote's `127.0.0.1` only:
+
+```
+Host mywinhost
+  RemoteForward 18923 /Users/<you>/.bct/chat.sock
+```
+
+On the host, point the client at that port (`setx` persists for *future*
+sessions; set it inline for the current one):
+
+```powershell
+setx BCT_CHAT_SOCK tcp:127.0.0.1:18923
+```
+
+`python3` on Windows is usually the Microsoft-Store stub — the SessionStart
+hook falls back to `python` automatically; use `python` in manual commands.
+
 ## Install — pick a recipe by host type
 
 | Host | Recipe |

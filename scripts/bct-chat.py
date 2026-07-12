@@ -3,7 +3,9 @@
 
 Speaks the line-JSON wire ({"paneID","cmd","args"} -> {"ok","text","error"})
 over a unix socket (default ~/.bct-chat.sock — the ssh-RemoteForward'ed BCT
-control socket; override with $BCT_CHAT_SOCK). Pure stdlib.
+control socket; override with $BCT_CHAT_SOCK). On hosts without AF_UNIX
+(Windows CPython), forward a TCP port instead and set
+$BCT_CHAT_SOCK=tcp:<host>:<port>. Pure stdlib.
 Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
 import json, os, socket, sys, time
@@ -16,13 +18,46 @@ NO_NEW = "(새 메시지 없음)"
 NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 
 
+def tcp_target(spec):
+    """$BCT_CHAT_SOCK=tcp:<host>:<port> -> (host, port); None means unix path."""
+    if not spec.startswith("tcp:"):
+        return None
+    host, _, port = spec[4:].rpartition(":")
+    if not port.isdigit():
+        return None
+    return (host or "127.0.0.1", int(port))
+
+
+def default_name():
+    return socket.gethostname()
+
+
+def sock_available():
+    t = tcp_target(SOCK)
+    if t is None:
+        return os.path.exists(SOCK)
+    try:
+        socket.create_connection(t, timeout=3).close()
+        return True
+    except OSError:
+        return False
+
+
+def connect():
+    t = tcp_target(SOCK)
+    if t is not None:
+        return socket.create_connection(t, timeout=10)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    s.connect(SOCK)
+    return s
+
+
 def rpc(cmd, args, pane_id=""):
-    if not os.path.exists(SOCK):
+    if tcp_target(SOCK) is None and not os.path.exists(SOCK):
         return {"ok": False, "error": f"socket not found: {SOCK} (ssh RemoteForward up?)"}
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(10)
-        s.connect(SOCK)
+        s = connect()
         s.sendall((json.dumps({"paneID": pane_id, "cmd": cmd, "args": args}) + "\n").encode())
         buf = b""
         while not buf.endswith(b"\n"):
@@ -154,18 +189,18 @@ def main(argv):
         die("usage: bct-chat.py <join|send|read|wait|list|leave|session-start> …")
     verb, rest = argv[0], argv[1:]
     if verb == "join":
-        do_join(" ".join(rest) or os.uname().nodename)
+        do_join(" ".join(rest) or default_name())
     elif verb == "session-start":
         # Fired by the claude-code SessionStart hook: silent no-ops by design.
         if os.environ.get("BCT_PANE_ID"):
             return                      # BCT pane — statusline auto-invite owns this
         ensure_stable_copy()
-        if not os.path.exists(SOCK):
+        if not sock_available():
             return                      # no ssh session forwarding the socket
         if identity() or load(PENDING):
             claim_pending()
             return                      # already joined / already requested
-        do_join(os.uname().nodename, wait_approval=False)
+        do_join(default_name(), wait_approval=False)
     elif verb == "send":
         msg = " ".join(rest)
         if not msg:
