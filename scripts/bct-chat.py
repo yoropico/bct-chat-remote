@@ -10,6 +10,11 @@ Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
 import json, os, socket, sys, time
 
+if hasattr(sys.stdout, "reconfigure"):
+    # Wire and room text are UTF-8; never trust the locale (Korean Windows = cp949).
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 STATE_DIR = os.path.expanduser("~/.bct-chat")
 IDENTITY = os.path.join(STATE_DIR, "identity.json")
 PENDING = os.path.join(STATE_DIR, "pending-join.json")
@@ -76,7 +81,7 @@ def rpc(cmd, args, pane_id=""):
 
 def load(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
@@ -84,7 +89,7 @@ def load(path):
 
 def save(path, obj):
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f)
 
 
@@ -98,16 +103,16 @@ def ensure_stable_copy():
     if me == os.path.abspath(STABLE):
         return
     try:
-        with open(me) as f:
+        with open(me, encoding="utf-8") as f:
             src = f.read()
         try:
-            with open(STABLE) as f:
+            with open(STABLE, encoding="utf-8") as f:
                 if f.read() == src:
                     return
         except OSError:
             pass
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(STABLE, "w") as f:
+        with open(STABLE, "w", encoding="utf-8") as f:
             f.write(src)
         os.chmod(STABLE, 0o755)
     except OSError:

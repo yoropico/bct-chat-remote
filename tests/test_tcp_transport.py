@@ -89,6 +89,20 @@ class TcpTransportTests(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_read_prints_emoji_under_non_utf8_locale(self):
+        # Room text may hold emoji; Korean-Windows stdout defaults to cp949.
+        srv = FakeChatServer(lambda req: {"ok": True, "text": "hi 🎉"})
+        try:
+            env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
+            env.update(HOME=self.home, BCT_CHAT_SOCK=f"tcp:127.0.0.1:{srv.port}",
+                       LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0")
+            r = subprocess.run([sys.executable, "-X", "utf8=0", CLIENT, "read"],
+                               env=env, capture_output=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace"))
+            self.assertIn("hi 🎉", r.stdout.decode("utf-8"))
+        finally:
+            srv.close()
+
     def test_tcp_unreachable_reports_socket_error(self):
         r = run_client(["read"], self.home, f"tcp:127.0.0.1:{free_port()}")
         self.assertEqual(r.returncode, 1)

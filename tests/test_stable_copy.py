@@ -44,6 +44,17 @@ class StableCopyTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(os.stat(self.stable).st_mtime_ns, before)
 
+    def test_survives_non_utf8_locale(self):
+        # Korean Windows defaults open() to cp949; the client source is UTF-8.
+        # PYTHONCOERCECLOCALE=0 + LC_ALL=C pins an ASCII locale to reproduce.
+        env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
+        env.update(HOME=self.home, LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0")
+        r = subprocess.run([sys.executable, "-X", "utf8=0", CLIENT, "session-start"],
+                           env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.stable, "rb") as f, open(CLIENT, "rb") as g:
+            self.assertEqual(f.read(), g.read())
+
     def test_bct_pane_guard_skips_copy(self):
         env = dict(os.environ, HOME=self.home, BCT_PANE_ID="deadbeef")
         r = subprocess.run([sys.executable, CLIENT, "session-start"],
