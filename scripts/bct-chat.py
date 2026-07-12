@@ -53,6 +53,32 @@ def save(path, obj):
         json.dump(obj, f)
 
 
+STABLE = os.path.join(STATE_DIR, "bct-chat.py")
+
+
+def ensure_stable_copy():
+    """Plugin installs live under a versioned cache path; keep one canonical
+    copy at ~/.bct-chat/bct-chat.py for the skill prose and manual use."""
+    me = os.path.abspath(__file__)
+    if me == os.path.abspath(STABLE):
+        return
+    try:
+        with open(me) as f:
+            src = f.read()
+        try:
+            with open(STABLE) as f:
+                if f.read() == src:
+                    return
+        except OSError:
+            pass
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STABLE, "w") as f:
+            f.write(src)
+        os.chmod(STABLE, 0o755)
+    except OSError:
+        pass                        # best-effort; never block session start
+
+
 def identity():
     obj = load(IDENTITY)
     return obj.get("participantID", "") if obj else ""
@@ -133,6 +159,7 @@ def main(argv):
         # Fired by the claude-code SessionStart hook: silent no-ops by design.
         if os.environ.get("BCT_PANE_ID"):
             return                      # BCT pane — statusline auto-invite owns this
+        ensure_stable_copy()
         if not os.path.exists(SOCK):
             return                      # no ssh session forwarding the socket
         if identity() or load(PENDING):
