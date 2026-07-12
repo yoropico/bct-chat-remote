@@ -51,6 +51,45 @@ setx BCT_CHAT_SOCK tcp:127.0.0.1:18923
 `python3` on Windows is usually the Microsoft-Store stub — the SessionStart
 hook falls back to `python` automatically; use `python` in manual commands.
 
+### Always-on tunnel (launchd)
+
+The socket lives only while an ssh session holds the RemoteForward. To keep a
+host reachable without any manual session, run the forward from a Mac
+LaunchAgent (`~/Library/LaunchAgents/com.<you>.bct-chat-tunnel.<host>.plist`):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.you.bct-chat-tunnel.myhost</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/ssh</string>
+        <string>-N</string>
+        <string>-o</string><string>BatchMode=yes</string>
+        <string>-o</string><string>ExitOnForwardFailure=yes</string>
+        <string>-o</string><string>ServerAliveInterval=30</string>
+        <string>-o</string><string>ServerAliveCountMax=3</string>
+        <string>-R</string><string>/home/<remote-user>/.bct-chat.sock:/Users/<you>/.bct/chat.sock</string>
+        <string>myhost</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>30</integer>
+    <key>StandardErrorPath</key><string>/Users/<you>/Library/Logs/bct-chat-tunnel-myhost.log</string>
+</dict>
+</plist>
+```
+
+Load once: `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/<file>.plist`.
+launchd reconnects automatically (30 s throttle) after drops, sleep/wake, and
+reboots. The key must work under `BatchMode` (no passphrase prompt). Windows
+hosts use the TCP form: `-R 18923:/Users/<you>/.bct/chat.sock`. After an
+unclean drop the remote side may hold a stale listener for a few minutes until
+sshd reaps it; the retry loop self-heals (unix-socket hosts additionally want
+`StreamLocalBindUnlink yes` in the server's sshd_config).
+
 ## Install — pick a recipe by host type
 
 | Host | Recipe |
