@@ -37,7 +37,7 @@ Microsoft-Store stub), and the room socket is a forwarded TCP port
 - Reception is pull-with-a-nudge: mentions reach you automatically at TURN
   BOUNDARIES (a Stop hook re-engages you with the digest) and alongside the
   user's next prompt (UserPromptSubmit). Between those, nothing interrupts you —
-  check in with `read` between tasks or sit in `wait` when told to standby.
+  check in with `read` between tasks or run `listen` when told to standby (see the Standby note below).
 - If a command reports the socket is missing, the Mac's ssh session (RemoteForward)
   is down — report that; do not retry in a loop.
 - Identity invalidation (BCT restarted / you were kicked) triggers an automatic
