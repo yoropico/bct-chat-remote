@@ -249,7 +249,15 @@ def pidfile_owner():
 def do_heartbeat(interval, max_uptime):
     """Prove this host is alive while any claude session on it is. BCT prunes an
     external after 10 min of silence and (before the retire/reseat change) that
-    destroyed its unread cursor — so a live-but-quiet host must keep ticking."""
+    destroyed its unread cursor — so a live-but-quiet host must keep ticking.
+
+    The pid file is this daemon's only coordination primitive, so two rules are
+    load-bearing: (1) release it in `finally`, and only when we still own it — a
+    daemon that yields to a newer instance must never touch, let alone delete,
+    the winner's file; (2) a tick that dies (die()/SystemExit from a chained
+    do_join, or any other exception — e.g. save() hitting a full disk) must not
+    take the daemon down with it. Its whole job is to keep ticking, so a bad tick
+    is just a failed tick and the existing two-strike rule applies."""
     if heartbeat_alive() and pidfile_owner() != os.getpid():
         return                      # another daemon has it
     me = os.getpid()
@@ -258,31 +266,42 @@ def do_heartbeat(interval, max_uptime):
         f.write(str(me))
     started = time.time()
     fails = 0
-    while True:
-        if not live_sessions():
-            break                   # every claude on this host is gone — get out of the way
-        if time.time() - started > max_uptime:
-            break                   # leaked marker backstop
-        if pidfile_owner() not in (me, 0):
-            break                   # a newer daemon took over
-        os.utime(PIDFILE, None)     # liveness for heartbeat_alive()
-        if not sock_available():
-            fails += 1
-        else:
-            r = rpc("chat-list", [], identity())        # read-only: its only job is touch()
-            if not r.get("ok") and r.get("error") == NOT_INVITED:
-                obj = load(IDENTITY)
-                request_join_if_allowed(obj["name"] if obj else default_name())
-                fails = 0
-            elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
+    try:
+        while True:
+            if not live_sessions():
+                break               # every claude on this host is gone — get out of the way
+            if time.time() - started > max_uptime:
+                break               # leaked marker backstop
+            if pidfile_owner() not in (me, 0):
+                break               # a newer daemon took over — its file, not ours to touch
+            try:
+                os.utime(PIDFILE, None)   # liveness for heartbeat_alive()
+            except OSError:
+                pass                # vanished underneath us; the owner check above will catch it
+            try:
+                if not sock_available():
+                    fails += 1
+                else:
+                    r = rpc("chat-list", [], identity())    # read-only: its only job is touch()
+                    if not r.get("ok") and r.get("error") == NOT_INVITED:
+                        obj = load(IDENTITY)
+                        request_join_if_allowed(obj["name"] if obj else default_name())
+                        fails = 0
+                    elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
+                        fails += 1
+                    else:
+                        fails = 0
+                        claim_pending()  # an approval may have landed since the last tick
+            except (Exception, SystemExit):
+                # e.g. request_join_if_allowed -> do_join -> die() on a chat-join error.
+                # A failed tick, nothing more — never let it kill the daemon outright.
                 fails += 1
-            else:
-                fails = 0
-                claim_pending()      # an approval may have landed since the last tick
-        if fails >= 2:
-            break                   # tunnel is down; the next session start respawns us
-        time.sleep(interval)
-    forget(PIDFILE)
+            if fails >= 2:
+                break               # tunnel is down; the next session start respawns us
+            time.sleep(interval)
+    finally:
+        if pidfile_owner() == me:
+            forget(PIDFILE)         # only ever release a pid file we still own
 
 
 def do_join(name, wait_approval=True):
@@ -396,9 +415,21 @@ def main(argv):
     elif verb == "heartbeat":
         interval, max_uptime = HEARTBEAT_INTERVAL, HEARTBEAT_MAX_UPTIME
         if "--interval" in rest:
-            interval = float(rest[rest.index("--interval") + 1])
+            i = rest.index("--interval")
+            if i + 1 >= len(rest):
+                die("heartbeat --interval <seconds>")
+            try:
+                interval = float(rest[i + 1])
+            except ValueError:
+                die("heartbeat --interval <seconds>")
         if "--max-uptime" in rest:
-            max_uptime = float(rest[rest.index("--max-uptime") + 1])
+            i = rest.index("--max-uptime")
+            if i + 1 >= len(rest):
+                die("heartbeat --max-uptime <seconds>")
+            try:
+                max_uptime = float(rest[i + 1])
+            except ValueError:
+                die("heartbeat --max-uptime <seconds>")
         do_heartbeat(interval, max_uptime)
     else:
         die(f"unknown verb: {verb}")
