@@ -284,8 +284,14 @@ def do_heartbeat(interval, max_uptime):
                 else:
                     r = rpc("chat-list", [], identity())    # read-only: its only job is touch()
                     if not r.get("ok") and r.get("error") == NOT_INVITED:
-                        obj = load(IDENTITY)
-                        request_join_if_allowed(obj["name"] if obj else default_name())
+                        # Poll an existing pending request first — never fire a fresh
+                        # chat-join while one is outstanding, or the new requestID
+                        # orphans any approval already in flight for the old one.
+                        if load(PENDING):
+                            claim_pending()
+                        else:
+                            obj = load(IDENTITY)
+                            request_join_if_allowed(obj["name"] if obj else default_name())
                         fails = 0
                     elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
                         fails += 1

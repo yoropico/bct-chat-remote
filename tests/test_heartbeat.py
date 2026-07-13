@@ -257,6 +257,89 @@ class HeartbeatTests(unittest.TestCase):
         mod.do_heartbeat(0, 100)                     # must not raise
         self.assertFalse(os.path.exists(mod.PIDFILE))
 
+    def test_pending_join_is_polled_not_reraised(self):
+        # A prior tick's chat-join already left a pending request outstanding.
+        # The NOT_INVITED branch must poll it (chat-join-poll), never fire a
+        # second chat-join — that would overwrite pending-join.json with a
+        # fresh requestID and orphan any approval the user is about to click
+        # on the old one.
+        def handler(req):
+            if req["cmd"] == "chat-join":
+                return {"ok": True, "text": "REQ-1"}
+            if req["cmd"] == "chat-join-poll":
+                return {"ok": True, "text": "pending"}   # neither approved nor denied/expired
+            return {"ok": False, "error": NOT_INVITED}    # chat-list: still not seated
+
+        srv = FakeChatServer(handler)
+        pending = os.path.join(self.state, "pending-join.json")
+        try:
+            self.proc = start_daemon(self.home, f"tcp:127.0.0.1:{srv.port}")
+            self.assertTrue(wait_for(lambda: os.path.exists(pending)))
+            with open(pending, encoding="utf-8") as f:
+                first_req = json.load(f)["requestID"]
+            # Let several more ticks pass while the poll keeps saying "pending".
+            self.assertTrue(wait_for(
+                lambda: sum(1 for r in srv.received if r["cmd"] == "chat-join-poll") >= 3,
+                timeout=5))
+            self.assertEqual(sum(1 for r in srv.received if r["cmd"] == "chat-join"), 1)
+            with open(pending, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["requestID"], first_req)
+        finally:
+            srv.close()
+
+    def test_approved_pending_is_claimed_and_join_stops(self):
+        # Once the bridge reports the pending request approved, the daemon
+        # must claim it: save the new identity, drop pending-join.json, and
+        # never fire another chat-join.
+        new_id = "B2C3D4E5-1111-2222-3333-444455556666"
+        state = {"approved": False}
+
+        def handler(req):
+            if req["cmd"] == "chat-join":
+                return {"ok": True, "text": "REQ-2"}
+            if req["cmd"] == "chat-join-poll":
+                state["approved"] = True
+                return {"ok": True, "text": f"approved\n{new_id}"}
+            if state["approved"]:
+                return {"ok": True, "text": "roster"}      # seated now
+            return {"ok": False, "error": NOT_INVITED}
+
+        srv = FakeChatServer(handler)
+        pending = os.path.join(self.state, "pending-join.json")
+        identity_path = os.path.join(self.state, "identity.json")
+        try:
+            self.proc = start_daemon(self.home, f"tcp:127.0.0.1:{srv.port}")
+            self.assertTrue(wait_for(lambda: any(r["cmd"] == "chat-join-poll" for r in srv.received)))
+            self.assertTrue(wait_for(lambda: not os.path.exists(pending)))
+            with open(identity_path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["participantID"], new_id)
+            time.sleep(0.6)     # a few more ticks; must not re-request
+            self.assertEqual(sum(1 for r in srv.received if r["cmd"] == "chat-join"), 1)
+        finally:
+            srv.close()
+
+    def test_denied_pending_arms_cooldown_and_stops_join(self):
+        # A denied/expired poll must arm the 30-min cooldown, and subsequent
+        # ticks must send no further chat-join until it expires.
+        def handler(req):
+            if req["cmd"] == "chat-join":
+                return {"ok": True, "text": "REQ-3"}
+            if req["cmd"] == "chat-join-poll":
+                return {"ok": False, "error": "denied"}
+            return {"ok": False, "error": NOT_INVITED}
+
+        srv = FakeChatServer(handler)
+        cooldown = os.path.join(self.state, "join-cooldown.json")
+        try:
+            self.proc = start_daemon(self.home, f"tcp:127.0.0.1:{srv.port}")
+            self.assertTrue(wait_for(lambda: os.path.exists(cooldown)))
+            with open(cooldown, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["outcome"], "denied")
+            time.sleep(0.6)     # a few more ticks; cooldown must hold
+            self.assertEqual(sum(1 for r in srv.received if r["cmd"] == "chat-join"), 1)
+        finally:
+            srv.close()
+
     def test_heartbeat_interval_without_a_value_dies_cleanly(self):
         # Matches wait --timeout's validation: no raw IndexError traceback.
         env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
