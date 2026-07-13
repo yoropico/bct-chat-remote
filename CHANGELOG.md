@@ -4,7 +4,7 @@ One entry per version, newest first, written in the SAME commit as the
 version bump. Mechanically enforced: the devmode pre-commit gate blocks a
 `plugin.json` "version" change that does not stage this file.
 
-## 1.4.0
+## 1.4.0 — 2026-07-14
 
 - Turn-boundary mention delivery: `stop-hook` blocks a finishing turn with the
   room digest when you are mentioned (peek → read, cursor-preserving detection);
