@@ -8,7 +8,7 @@ control socket; override with $BCT_CHAT_SOCK). On hosts without AF_UNIX
 $BCT_CHAT_SOCK=tcp:<host>:<port>. Pure stdlib.
 Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
-import json, os, socket, subprocess, sys, time
+import json, os, re, socket, subprocess, sys, time
 
 if hasattr(sys.stdout, "reconfigure"):
     # Wire and room text are UTF-8; never trust the locale (Korean Windows = cp949).
@@ -325,15 +325,31 @@ def do_join(name, wait_approval=True):
     die("승인 대기 시간 초과")
 
 
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
 def hook_session_id():
     """claude-code pipes the hook payload as JSON on stdin. An interactive run has a
-    tty there — never block on it."""
+    tty there — never block on it. The result is used directly as a filename under
+    sessions/, so it is never trusted as-is: any parse/shape failure — a malformed
+    payload, a non-object top-level value (a bare list/string/number/null all raise
+    AttributeError out of a naive `.get()`) — is treated the same as a missing
+    session_id, and the extracted value is then os.path.basename()'d and checked
+    against a strict charset before being handed back. A value that fails that check
+    (empty, ".", "..", or containing anything outside [A-Za-z0-9._-]) is treated as
+    absent ("") rather than raised — the caller never needs its own try/except
+    around this, and a traversal-shaped id can never reach a filesystem call."""
     try:
         if sys.stdin is None or sys.stdin.isatty():
             return ""
-        return str(json.loads(sys.stdin.read() or "{}").get("session_id", ""))
-    except (OSError, ValueError):
+        obj = json.loads(sys.stdin.read() or "{}")
+        sid = str(obj.get("session_id", "")) if isinstance(obj, dict) else ""
+    except Exception:
         return ""
+    sid = os.path.basename(sid)
+    if sid in ("", ".", "..") or not SESSION_ID_RE.match(sid):
+        return ""
+    return sid
 
 
 def session_start():
@@ -345,36 +361,51 @@ def session_start():
     python on ANY nonzero exit (Windows lacks a reliable "is python3 the MS Store
     stub" test), so a die() escaping here would re-run the whole hook with stdin
     already drained — no session id, no marker, no daemon, and a duplicate chat-join
-    banner. So membership/join failures are swallowed here; only the interpreter
-    failing to start may trigger the shell fallback. The user-facing verbs
-    (send/read/wait/list/join/leave) keep die()'s normal nonzero-exit behaviour."""
+    banner. So nothing past ensure_stable_copy() may escape as an exception or a
+    SystemExit — the same (Exception, SystemExit) idiom do_heartbeat() already uses
+    for its own tick loop, applied here to the whole rest of the hook (mark_session()
+    included: a malformed session id could in principle still slip past
+    hook_session_id()'s own sanitizing, and this is the backstop for that). A join
+    failure specifically must still let spawn_heartbeat() run afterwards — a marker
+    with no daemon is a worse regression than either symptom alone — so that inner
+    step keeps its own narrower try immediately around the join call. The user-facing
+    verbs (send/read/wait/list/join/leave) keep die()'s normal nonzero-exit
+    behaviour."""
     if os.environ.get("BCT_PANE_ID"):
         return                      # BCT pane — statusline auto-invite owns this
     ensure_stable_copy()
-    sid = hook_session_id()
-    if not sock_available():
-        return                      # no ssh session forwarding the socket
-    if sid:
-        mark_session(sid)           # before spawning: the daemon exits on an empty set
     try:
-        if load(PENDING):
-            claim_pending()
-        elif not (identity() and membership_live()):
-            obj = load(IDENTITY)
-            request_join_if_allowed(obj["name"] if obj else default_name())
-    except SystemExit:
-        pass                        # join failed (die()) — still spawn the heartbeat below
-    if sid:
-        spawn_heartbeat()
+        sid = hook_session_id()
+        if not sock_available():
+            return                  # no ssh session forwarding the socket
+        if sid:
+            mark_session(sid)       # before spawning: the daemon exits on an empty set
+        try:
+            if load(PENDING):
+                claim_pending()
+            elif not (identity() and membership_live()):
+                obj = load(IDENTITY)
+                request_join_if_allowed(obj["name"] if obj else default_name())
+        except (Exception, SystemExit):
+            pass                    # join failed — still spawn the heartbeat below
+        if sid:
+            spawn_heartbeat()
+    except (Exception, SystemExit):
+        pass                        # never let a hook verb trigger the python3->python fallback
 
 
 def session_end():
     """SessionEnd hook: drop this session's marker. The daemon is NOT killed — another
     claude session on this host may still be in the room; it exits on its own once the
-    marker set empties."""
-    sid = hook_session_id()
-    if sid:
-        unmark_session(sid)
+    marker set empties.
+
+    Invariant: this verb must always exit 0 too — see session_start()'s docstring."""
+    try:
+        sid = hook_session_id()
+        if sid:
+            unmark_session(sid)
+    except (Exception, SystemExit):
+        pass
 
 
 def authed(cmd, args):
