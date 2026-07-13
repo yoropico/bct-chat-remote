@@ -61,7 +61,10 @@ class SessionMarkerTests(unittest.TestCase):
                 return              # exited
             time.sleep(0.05)
         try:
-            os.kill(pid, signal.SIGKILL)
+            # Windows has no signal.SIGKILL at all (not just no delivery semantics
+            # for it) — referencing it directly would AttributeError on a
+            # first-class host that never needed this fallback branch to fire.
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         except OSError:
             pass
 
@@ -96,6 +99,122 @@ class SessionMarkerTests(unittest.TestCase):
                      json.dumps({"session_id": "sess-abc"}))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(os.path.exists(self.marker))
+
+    def test_session_end_survives_non_object_json_payload(self):
+        """A non-object top-level payload (a list, a bare string) makes
+        hook_session_id()'s old `.get("session_id", "")` raise AttributeError —
+        uncaught by the narrow `except (OSError, ValueError)` — which used to
+        escape session_end() and hand hooks.json's `||` fallback a nonzero exit.
+        The hook verb must exit 0 regardless of what shape stdin holds."""
+        for payload in ("[1, 2]", '"hi"', "null", "42"):
+            with self.subTest(payload=payload):
+                r = run_hook("session-end", self.home, "tcp:127.0.0.1:1", payload)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_session_start_survives_malformed_pending_join(self):
+        """A pending-join.json missing "requestID" makes claim_pending() raise
+        KeyError, which is not a SystemExit — the old `except SystemExit` around
+        session_start()'s join block let it escape and exit 1."""
+        with open(os.path.join(self.state, "pending-join.json"), "w", encoding="utf-8") as f:
+            json.dump({"name": "HOST"}, f)          # no "requestID"
+        srv = FakeChatServer(lambda req: {"ok": True, "text": "roster"})
+        try:
+            r = run_hook("session-start", self.home, f"tcp:127.0.0.1:{srv.port}",
+                         json.dumps({"session_id": "sess-abc"}))
+            self.assertEqual(r.returncode, 0, r.stderr)
+        finally:
+            srv.close()
+
+    def test_session_start_survives_traversal_shaped_session_id(self):
+        """session_id values shaped like a path (containing "/") or exactly ".."
+        used to reach mark_session() unsanitized, which joins them onto
+        SESSIONS_DIR and opens the result for writing — raising
+        FileNotFoundError ("foo/bar": no such intermediate directory "foo") or
+        IsADirectoryError (".." resolves back to the state dir itself). Both used
+        to exit 1. After the fix, the hook must exit 0 either way. "foo/bar" is
+        sanitized down to the bare "bar" by os.path.basename() — a safe,
+        contained id (no directory named "foo" is ever created) — so it is
+        still accepted and marked/heartbeated normally. "..", after
+        basename()ing, is exactly ".." — explicitly rejected by the check — so
+        it is treated as an absent id: no marker, no sessions/ dir, no
+        daemon."""
+        srv = FakeChatServer(lambda req: {"ok": True, "text": "roster"})
+        try:
+            r = run_hook("session-start", self.home, f"tcp:127.0.0.1:{srv.port}",
+                         json.dumps({"session_id": "foo/bar"}))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(os.path.isdir(os.path.join(self.state, "sessions", "foo")),
+                              '"foo/bar" must never create a "foo" directory')
+            self.assertTrue(os.path.exists(os.path.join(self.state, "sessions", "bar")),
+                             '"foo/bar" should sanitize down to a contained marker "bar"')
+        finally:
+            srv.close()
+            self._reap_heartbeat_daemon()   # "bar" is valid, so this spawned a daemon too
+
+        # Fresh HOME for the ".." case — the first part above already legitimately
+        # spawned and reaped a daemon under self.home, and a reaped (SIGTERM'd, no
+        # signal handler) daemon does NOT clean up its own pidfile on the way out,
+        # so re-using self.home here would false-negative on a stale leftover file.
+        dotdot_home = tempfile.mkdtemp()
+        dotdot_state = os.path.join(dotdot_home, ".bct-chat")
+        os.makedirs(dotdot_state)
+        dotdot_pidfile = os.path.join(dotdot_state, "heartbeat.pid")
+        srv = FakeChatServer(lambda req: {"ok": True, "text": "roster"})
+        try:
+            r = run_hook("session-start", dotdot_home, f"tcp:127.0.0.1:{srv.port}",
+                         json.dumps({"session_id": ".."}))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertFalse(os.path.isdir(os.path.join(dotdot_state, "sessions")),
+                              'session_id=".." should be treated as absent — no sessions/ dir')
+            self.assertFalse(os.path.exists(dotdot_pidfile),
+                              'session_id=".." should not have spawned a heartbeat daemon')
+        finally:
+            srv.close()
+            shutil.rmtree(dotdot_home, ignore_errors=True)
+
+    def test_session_end_traversal_session_id_cannot_delete_outside_sessions_dir(self):
+        """session_id="../identity.json" must not let session-end delete
+        ~/.bct-chat/identity.json. Unsanitized, unmark_session() joins it onto
+        SESSIONS_DIR (.../sessions/../identity.json), which normalizes right back
+        to the real identity file and removes it. os.path.basename() must strip
+        the traversal so at worst a same-named file *inside* sessions/ is
+        touched — never anything outside it."""
+        identity_path = os.path.join(self.state, "identity.json")
+        self.assertTrue(os.path.exists(identity_path))     # written by setUp
+        # A prior session-start already created sessions/ — the traversal needs a
+        # real directory to walk through and back out of; without it the OS can't
+        # even resolve the ".." component and the exploit doesn't reproduce.
+        os.makedirs(os.path.join(self.state, "sessions"), exist_ok=True)
+        payload = json.dumps({"session_id": "../identity.json"})
+        r = run_hook("session-end", self.home, "tcp:127.0.0.1:1", payload)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(identity_path),
+                         "traversal-shaped session_id deleted a file outside sessions/")
+
+    def test_reap_falls_back_when_sigkill_is_unavailable(self):
+        """signal.SIGKILL does not exist as a module attribute on Windows — the
+        reaper's fallback kill must not reference it directly (use
+        getattr(signal, "SIGKILL", signal.SIGTERM) or equivalent), or this
+        (portable, test-only) cleanup helper itself breaks the suite on a
+        first-class host. Simulate the missing attribute here and force the
+        SIGKILL-fallback branch by spawning a child that ignores SIGTERM."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)"])
+        with open(self.heartbeat_pidfile, "w", encoding="utf-8") as f:
+            f.write(str(proc.pid))
+        had_sigkill = hasattr(signal, "SIGKILL")
+        real_sigkill = getattr(signal, "SIGKILL", None)
+        if had_sigkill:
+            del signal.SIGKILL
+        try:
+            self._reap_heartbeat_daemon()           # must not raise AttributeError
+        finally:
+            if had_sigkill:
+                signal.SIGKILL = real_sigkill
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
 
     def test_mark_session_precedes_spawn_heartbeat_and_the_daemon_survives(self):
         """Guards the ordering invariant: mark_session() must run before
