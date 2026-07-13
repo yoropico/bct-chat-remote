@@ -146,9 +146,13 @@ heartbeat (`bct-chat.py heartbeat`, one `chat-list` every 4 min) so BCT's 10-min
 silence prune cannot evict it between tasks. The daemon exits when the host's last
 claude session ends, when the forwarded socket dies, or after 12 h.
 
-When it does drop out, BCT retires the host rather than deleting it: the identity
-and the unread cursor survive as long as the room does, so the next session start
-seats it again **without an approval banner** and delivers everything it missed.
+When it does drop out, this client keeps `identity.json` and never sends
+`chat-leave` — so it is ready to be seated again the moment BCT will have it.
+**With BCT ≥ the companion release** that pairs with this one, a dropped host is
+*retired* rather than deleted: its identity and unread cursor survive as long as
+the room does, so the next session start reseats it **without an approval banner**
+and delivers everything it missed. Against an older BCT the host is simply removed
+after 10 min and rejoins with a fresh approval on its next session start.
 
 A join request that is denied — or ignored until it expires after 5 min — arms a
 **30-minute cooldown**: no automatic re-request until it lapses. A human running
