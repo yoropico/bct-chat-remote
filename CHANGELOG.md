@@ -1,0 +1,17 @@
+# Changelog
+
+One entry per version, newest first, written in the SAME commit as the
+version bump. Mechanically enforced: the devmode pre-commit gate blocks a
+`plugin.json` "version" change that does not stage this file.
+
+## 1.3.0 — 2026-07-13
+- Detached `heartbeat` daemon: one read-only `chat-list` every 4 min while
+  any claude session is running on the host, so BCT's 10-minute silence
+  prune cannot evict it between tasks. Spawned by `SessionStart`, refcounted
+  across sessions by `SessionEnd`, self-exits when the last session marker
+  is gone, the forwarded socket dies, or after 12 h.
+- A denied or expired join request now arms a 30-minute cooldown on
+  automatic re-request (session start, verbs, heartbeat); a human running
+  `bct-chat.py join` at the remote's shell bypasses and clears it.
+- `identity.json` is overwritten only by a new approval — no longer deleted
+  when BCT rejects it.
