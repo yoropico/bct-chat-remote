@@ -83,6 +83,15 @@ class PushHookTests(unittest.TestCase):
         self.assertTrue(out.startswith("[bct-chat]"))
         self.assertNotIn('"decision"', out)          # context, not control JSON
 
+    def test_hooks_json_registers_push_hooks(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "hooks", "hooks.json"), encoding="utf-8") as f:
+            hooks = json.load(f)["hooks"]
+        for event, verb in (("Stop", "stop-hook"), ("UserPromptSubmit", "prompt-submit")):
+            cmd = hooks[event][0]["hooks"][0]["command"]
+            self.assertIn(verb, cmd)
+            self.assertIn("|| python ", cmd)         # Windows MS-Store-stub fallback
+
 
 if __name__ == "__main__":
     unittest.main()
