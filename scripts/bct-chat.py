@@ -430,6 +430,77 @@ def authed(cmd, args):
     return r
 
 
+REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
+              '(명단: `python3 ~/.bct-chat/bct-chat.py list`, 새 메시지 확인: '
+              '`python3 ~/.bct-chat/bct-chat.py read`)')
+
+
+def compose_digest(name, read_text):
+    """Mirror BCT's local chatInjection shape: identity line, the unseen lines
+    exactly as chat-read returned them, then the reply instruction."""
+    lines = [f"[bct-chat] 단체 채팅방 — 당신은 @{name} 입니다. 새 메시지:"]
+    lines += [l for l in read_text.splitlines() if l]
+    lines.append(REPLY_HINT)
+    return "\n".join(lines)
+
+
+def drain_stdin():
+    """Hook payloads arrive on stdin; read them off so the writer never blocks,
+    but never block on a tty ourselves."""
+    try:
+        if sys.stdin is not None and not sys.stdin.isatty():
+            sys.stdin.read()
+    except Exception:
+        pass
+
+
+def pending_digest():
+    """The digest to deliver, or None. chat-peek decides (cursor-preserving —
+    a non-mention backlog stays unseen for a future mention delivery, same
+    semantics as BCT's local push); only a mentioned backlog is consumed via
+    chat-read. Every failure path — no socket, no identity, an old BCT without
+    chat-peek, a read error — is None: the hooks must never disturb a turn."""
+    if os.environ.get("BCT_PANE_ID"):
+        return None                  # BCT-pane claude — native push owns delivery
+    if not sock_available() or not identity():
+        return None
+    r = rpc("chat-peek", [], identity())
+    parts = (r.get("text") or "").split() if r.get("ok") else []
+    if len(parts) != 2 or parts[1] != "1":
+        return None
+    rd = rpc("chat-read", [], identity())
+    text = rd.get("text") or ""
+    if not rd.get("ok") or not text or text == NO_NEW:
+        return None
+    obj = load(IDENTITY) or {}
+    return compose_digest(obj.get("name", default_name()), text)
+
+
+def stop_hook():
+    """Stop hook: block the turn end with the digest when mentioned — claude
+    answers the room in place. Always exits 0 (see session_start docstring)."""
+    drain_stdin()
+    try:
+        d = pending_digest()
+        if d:
+            print(json.dumps({"decision": "block", "reason": d}, ensure_ascii=False))
+    except (Exception, SystemExit):
+        pass
+
+
+def prompt_submit_hook():
+    """UserPromptSubmit hook: same detection, but the digest rides along as
+    CONTEXT (plain stdout) with the user's prompt — covers a fully idle claude
+    the moment the user next engages. Always exits 0."""
+    drain_stdin()
+    try:
+        d = pending_digest()
+        if d:
+            print(d)
+    except (Exception, SystemExit):
+        pass
+
+
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
@@ -437,7 +508,7 @@ def die(msg):
 
 def main(argv):
     if not argv:
-        die("usage: bct-chat.py <join|send|read|wait|list|leave|session-start|session-end> …")
+        die("usage: bct-chat.py <join|send|read|wait|list|leave|session-start|session-end|stop-hook|prompt-submit> …")
     verb, rest = argv[0], argv[1:]
     if verb == "join":
         clear_cooldown()                      # manual intent overrides the cooldown
@@ -446,6 +517,10 @@ def main(argv):
         session_start()
     elif verb == "session-end":
         session_end()
+    elif verb == "stop-hook":
+        stop_hook()
+    elif verb == "prompt-submit":
+        prompt_submit_hook()
     elif verb == "send":
         msg = " ".join(rest)
         if not msg:

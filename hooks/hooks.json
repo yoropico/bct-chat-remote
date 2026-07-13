@@ -21,6 +21,28 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/bct-chat.py\" stop-hook || python \"${CLAUDE_PLUGIN_ROOT}/scripts/bct-chat.py\" stop-hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/bct-chat.py\" prompt-submit || python \"${CLAUDE_PLUGIN_ROOT}/scripts/bct-chat.py\" prompt-submit",
+            "timeout": 15
+          }
+        ]
+      }
     ]
   }
 }

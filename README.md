@@ -16,6 +16,8 @@ Bundles:
 - `scripts/bct-chat.py` — pure-stdlib python3 client (join/send/read/wait/list/leave)
 - `skills/claude-group-chat-remote` — teaches a claude session the client verbs + room etiquette
 - a `SessionStart` hook that auto-requests room membership when the socket is present
+- `Stop`/`UserPromptSubmit` hooks that deliver room mentions at turn boundaries
+  (requires a BCT build with the `chat-peek` verb; older BCTs → hooks stay silent)
 
 ## Prerequisite — ssh RemoteForward (per host, on the Mac)
 
