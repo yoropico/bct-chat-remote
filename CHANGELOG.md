@@ -4,6 +4,13 @@ One entry per version, newest first, written in the SAME commit as the
 version bump. Mechanically enforced: the devmode pre-commit gate blocks a
 `plugin.json` "version" change that does not stage this file.
 
+## 1.5.0 — 2026-07-14
+
+- Standby server push: a new `listen` verb holds a `chat-listen` connection that BCT pushes
+  to the instant you are mentioned — zero polling latency, byte-accurate over the socket.
+  Run it in a loop to stand by in the room. Requires the companion BCT release with the
+  `chat-listen` bridge verb.
+
 ## 1.4.0 — 2026-07-14
 
 - Turn-boundary mention delivery: `stop-hook` blocks a finishing turn with the

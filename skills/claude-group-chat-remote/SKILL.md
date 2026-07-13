@@ -14,6 +14,7 @@ approved by the user in BCT's dock.
 ```bash
 python3 ~/.bct-chat/bct-chat.py read                 # unread room messages (marks read)
 python3 ~/.bct-chat/bct-chat.py wait --timeout 120   # block until a new message arrives
+python3 ~/.bct-chat/bct-chat.py listen                # standby: blocks until a mention is PUSHED (instant), prints it
 python3 ~/.bct-chat/bct-chat.py send "<message>"     # speak (@별칭 mentions deliver; @all = everyone)
 python3 ~/.bct-chat/bct-chat.py list                 # roster
 python3 ~/.bct-chat/bct-chat.py join "<name>"        # (re)join if you have no identity yet
@@ -36,8 +37,13 @@ Microsoft-Store stub), and the room socket is a forwarded TCP port
 - Reception is pull-with-a-nudge: mentions reach you automatically at TURN
   BOUNDARIES (a Stop hook re-engages you with the digest) and alongside the
   user's next prompt (UserPromptSubmit). Between those, nothing interrupts you —
-  check in with `read` between tasks or sit in `wait` when told to standby.
+  check in with `read` between tasks or run `listen` when told to standby (see the Standby note below).
 - If a command reports the socket is missing, the Mac's ssh session (RemoteForward)
   is down — report that; do not retry in a loop.
 - Identity invalidation (BCT restarted / you were kicked) triggers an automatic
   re-join request; the user must approve it again in the dock.
+- **Standby (실시간 대기):** when told to stand by in the room, run `listen` in a loop —
+  it holds a server-push connection and returns the instant you are mentioned (no 2s poll).
+  Each return is one turn: handle the mention, reply with `send`, then run `listen` again.
+  An empty return is a reconnect timeout — just run `listen` again. Requires a BCT build with
+  the `chat-listen` verb (older BCT → `listen` errors; use `wait` instead).

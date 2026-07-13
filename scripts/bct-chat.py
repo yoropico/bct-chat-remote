@@ -22,6 +22,7 @@ COOLDOWN = os.path.join(STATE_DIR, "join-cooldown.json")
 JOIN_COOLDOWN = 1800            # 30 min — a request the user denied or ignored must not nag
 SOCK = os.environ.get("BCT_CHAT_SOCK", os.path.expanduser("~/.bct-chat.sock"))
 NO_NEW = "(새 메시지 없음)"
+NO_MENTION = "(새 멘션 없음)"          # chat-listen timeout sentinel (server push)
 NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
 PIDFILE = os.path.join(STATE_DIR, "heartbeat.pid")
@@ -54,21 +55,21 @@ def sock_available():
         return False
 
 
-def connect():
+def connect(timeout=10):
     t = tcp_target(SOCK)
     if t is not None:
-        return socket.create_connection(t, timeout=10)
+        return socket.create_connection(t, timeout=timeout)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(10)
+    s.settimeout(timeout)
     s.connect(SOCK)
     return s
 
 
-def rpc(cmd, args, pane_id=""):
+def rpc(cmd, args, pane_id="", timeout=10):
     if tcp_target(SOCK) is None and not os.path.exists(SOCK):
         return {"ok": False, "error": f"socket not found: {SOCK} (ssh RemoteForward up?)"}
     try:
-        s = connect()
+        s = connect(timeout)
         s.sendall((json.dumps({"paneID": pane_id, "cmd": cmd, "args": args}) + "\n").encode())
         buf = b""
         while not buf.endswith(b"\n"):
@@ -414,11 +415,11 @@ def session_end():
         pass
 
 
-def authed(cmd, args):
+def authed(cmd, args, timeout=10):
     """RPC with identity; auto re-join on identity invalidation (BCT restart/eviction)."""
     if not identity():
         claim_pending()
-    r = rpc(cmd, args, identity())
+    r = rpc(cmd, args, identity(), timeout=timeout)
     if not r.get("ok") and r.get("error") == NOT_INVITED:
         obj = load(IDENTITY)
         if obj:
@@ -426,7 +427,7 @@ def authed(cmd, args):
                 return r                      # cooling down — surface NOT_INVITED as-is
             print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
             do_join(obj["name"])              # blocking: a live verb wants an answer
-            r = rpc(cmd, args, identity())
+            r = rpc(cmd, args, identity(), timeout=timeout)
     return r
 
 
@@ -508,7 +509,7 @@ def die(msg):
 
 def main(argv):
     if not argv:
-        die("usage: bct-chat.py <join|send|read|wait|list|leave|session-start|session-end|stop-hook|prompt-submit> …")
+        die("usage: bct-chat.py <join|send|read|wait|listen|list|leave|session-start|session-end|stop-hook|prompt-submit> …")
     verb, rest = argv[0], argv[1:]
     if verb == "join":
         clear_cooldown()                      # manual intent overrides the cooldown
@@ -550,6 +551,16 @@ def main(argv):
                 return
             time.sleep(2)
         die(f"timeout: no new message within {timeout}s")
+    elif verb == "listen":
+        # Server-push standby: chat-listen holds the connection until a mention
+        # is posted (or ~30s server-side). One call = one turn; the standby loop
+        # re-invokes. 40s socket timeout tolerates the ~30s server hold + slack.
+        r = authed("chat-listen", [], timeout=40)
+        if not r.get("ok"):
+            die(r.get("error", "error"))
+        txt = r.get("text", "")
+        if txt and txt not in (NO_NEW, NO_MENTION):
+            print(txt)
     elif verb == "list":
         r = authed("chat-list", [])
         if not r.get("ok"):
