@@ -18,6 +18,8 @@ if hasattr(sys.stdout, "reconfigure"):
 STATE_DIR = os.path.expanduser("~/.bct-chat")
 IDENTITY = os.path.join(STATE_DIR, "identity.json")
 PENDING = os.path.join(STATE_DIR, "pending-join.json")
+COOLDOWN = os.path.join(STATE_DIR, "join-cooldown.json")
+JOIN_COOLDOWN = 1800            # 30 min — a request the user denied or ignored must not nag
 SOCK = os.environ.get("BCT_CHAT_SOCK", os.path.expanduser("~/.bct-chat.sock"))
 NO_NEW = "(새 메시지 없음)"
 NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
@@ -100,6 +102,37 @@ def forget(path):
         pass
 
 
+def cooldown_remaining():
+    """Seconds until an automatic join request is allowed again (0 = now)."""
+    obj = load(COOLDOWN)
+    if not obj:
+        return 0
+    left = JOIN_COOLDOWN - (time.time() - obj.get("lastFailedAt", 0))
+    return int(left) if left > 0 else 0
+
+
+def may_request_join():
+    return cooldown_remaining() == 0
+
+
+def note_join_failure(outcome):
+    save(COOLDOWN, {"lastFailedAt": time.time(), "outcome": outcome})
+
+
+def clear_cooldown():
+    forget(COOLDOWN)
+
+
+def request_join_if_allowed(name):
+    """Automatic (non-blocking) join request, gated by the cooldown. The manual
+    `join` verb bypasses this — a human at the remote's shell always wins."""
+    if not may_request_join():
+        print(f"입장 재요청 쿨다운 중 — {cooldown_remaining() // 60}분 후 재시도", file=sys.stderr)
+        return False
+    do_join(name, wait_approval=False)
+    return True
+
+
 STABLE = os.path.join(STATE_DIR, "bct-chat.py")
 
 
@@ -152,9 +185,11 @@ def claim_pending():
     if r.get("ok") and (r.get("text") or "").startswith("approved\n"):
         save(IDENTITY, {"participantID": r["text"].split("\n", 1)[1], "name": obj["name"]})
         forget(PENDING)
+        clear_cooldown()                      # seated — the slate is clean
         return True
     if not r.get("ok") and r.get("error") in ("denied", "expired"):
         forget(PENDING)
+        note_join_failure(r["error"])         # arm the 30-min cooldown
     return False
 
 
@@ -192,7 +227,7 @@ def session_start():
         return                      # approved just now, or still awaiting the user
     if identity() and membership_live():
         return
-    do_join(default_name(), wait_approval=False)
+    request_join_if_allowed(default_name())
 
 
 def authed(cmd, args):
@@ -220,6 +255,7 @@ def main(argv):
         die("usage: bct-chat.py <join|send|read|wait|list|leave|session-start> …")
     verb, rest = argv[0], argv[1:]
     if verb == "join":
+        clear_cooldown()                      # manual intent overrides the cooldown
         do_join(" ".join(rest) or default_name())
     elif verb == "session-start":
         session_start()
