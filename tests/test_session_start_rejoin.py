@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,7 +62,28 @@ class SessionStartRejoinTests(unittest.TestCase):
             self.assertIn("chat-join", self.cmds(srv))
             with open(self.pending, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["requestID"], "REQ-9")
-            self.assertFalse(os.path.exists(self.identity))   # dead id must not linger
+            # The dead id is KEPT until a new approval overwrites it: the rejoin path
+            # needs the name stored beside it, and the heartbeat needs something to send.
+            with open(self.identity, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["participantID"], STALE_ID)
+        finally:
+            srv.close()
+
+    def test_stale_identity_within_cooldown_does_not_request(self):
+        def handler(req):
+            if req["cmd"] == "chat-join":
+                return {"ok": True, "text": "REQ-NOPE"}
+            return {"ok": False, "error": NOT_INVITED}
+
+        self.write_identity()
+        with open(os.path.join(self.state, "join-cooldown.json"), "w", encoding="utf-8") as f:
+            json.dump({"lastFailedAt": time.time() - 60, "outcome": "denied"}, f)
+        srv = FakeChatServer(handler)
+        try:
+            r = run_session_start(self.home, f"tcp:127.0.0.1:{srv.port}")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("chat-join", self.cmds(srv))
+            self.assertTrue(os.path.exists(self.identity))
         finally:
             srv.close()
 
