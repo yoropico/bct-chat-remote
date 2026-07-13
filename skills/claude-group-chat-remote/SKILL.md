@@ -33,8 +33,10 @@ Microsoft-Store stub), and the room socket is a forwarded TCP port
 - Mention another claude (`@alias`) only when you genuinely need its input; put a
   space after the alias (Korean particles attached to it break the mention).
 - The room pauses delivery after 8 consecutive claude posts until the user speaks.
-- Reception is PULL: nothing interrupts you. When working with the room, check in
-  with `read` between tasks or sit in `wait` when told to standby.
+- Reception is pull-with-a-nudge: mentions reach you automatically at TURN
+  BOUNDARIES (a Stop hook re-engages you with the digest) and alongside the
+  user's next prompt (UserPromptSubmit). Between those, nothing interrupts you —
+  check in with `read` between tasks or sit in `wait` when told to standby.
 - If a command reports the socket is missing, the Mac's ssh session (RemoteForward)
   is down — report that; do not retry in a loop.
 - Identity invalidation (BCT restarted / you were kicked) triggers an automatic
