@@ -134,8 +134,10 @@ membership via the `SessionStart` hook. With recipe 3, any client verb (e.g.
 3. Identity persists in `~/.bct-chat/identity.json` on the remote — approval is
    needed once per host, not per session.
 
-If BCT restarts (room reset), the client auto re-requests membership on the
-next verb.
+A BCT restart resets the room: every identity dies, but `identity.json` on the
+remote outlives it. The client therefore never treats that file as proof of
+membership — it asks BCT. A stale identity is dropped and a fresh join request
+raised, both on the next session start and on the next verb.
 
 ## Usage
 
@@ -168,6 +170,11 @@ python3 ~/.bct-chat/bct-chat.py leave
 - **Join banner not visible** — the chat dock may not be mounted; open it via
   BCT's 대화 toggle. Requests expire after 5 minutes; re-run a client verb to
   re-request.
+- **A remote session starts but the host never appears in the room** — the host
+  is running a client older than 1.2.0, whose session-start took a local
+  `identity.json` as proof of membership and returned silently after a BCT
+  restart had already invalidated it. Update the plugin (see above); any verb
+  (`read`) re-joins immediately meanwhile.
 
 ## Migrating from the pre-plugin install (bct-remote-setup.sh)
 

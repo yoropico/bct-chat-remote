@@ -93,6 +93,13 @@ def save(path, obj):
         json.dump(obj, f)
 
 
+def forget(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 STABLE = os.path.join(STATE_DIR, "bct-chat.py")
 
 
@@ -124,6 +131,18 @@ def identity():
     return obj.get("participantID", "") if obj else ""
 
 
+def membership_live():
+    """Does BCT still know this identity? A BCT restart resets the room, but
+    identity.json outlives it — so ask the bridge, never trust the file. Drops
+    the dead identity so the caller can re-request. Any other error (bridge
+    hiccup) counts as live: better silent than a spurious join banner."""
+    r = rpc("chat-list", [], identity())          # read-only probe; consumes no messages
+    if r.get("ok") or r.get("error") != NOT_INVITED:
+        return True
+    forget(IDENTITY)
+    return False
+
+
 def claim_pending():
     """If a session-start hook left a requestID, try to claim the identity."""
     obj = load(PENDING)
@@ -132,16 +151,10 @@ def claim_pending():
     r = rpc("chat-join-poll", [obj["requestID"]])
     if r.get("ok") and (r.get("text") or "").startswith("approved\n"):
         save(IDENTITY, {"participantID": r["text"].split("\n", 1)[1], "name": obj["name"]})
-        try:
-            os.remove(PENDING)
-        except OSError:
-            pass
+        forget(PENDING)
         return True
     if not r.get("ok") and r.get("error") in ("denied", "expired"):
-        try:
-            os.remove(PENDING)
-        except OSError:
-            pass
+        forget(PENDING)
     return False
 
 
@@ -166,6 +179,22 @@ def do_join(name, wait_approval=True):
     die("승인 대기 시간 초과")
 
 
+def session_start():
+    """SessionStart hook: silent no-ops by design, but never silently absent —
+    if the room no longer knows us, raise a fresh join request."""
+    if os.environ.get("BCT_PANE_ID"):
+        return                      # BCT pane — statusline auto-invite owns this
+    ensure_stable_copy()
+    if not sock_available():
+        return                      # no ssh session forwarding the socket
+    if load(PENDING):
+        claim_pending()
+        return                      # approved just now, or still awaiting the user
+    if identity() and membership_live():
+        return
+    do_join(default_name(), wait_approval=False)
+
+
 def authed(cmd, args):
     """RPC with identity; auto re-join on identity invalidation (BCT restart/kick)."""
     if not identity():
@@ -174,10 +203,7 @@ def authed(cmd, args):
     if not r.get("ok") and r.get("error") == NOT_INVITED:
         obj = load(IDENTITY)
         if obj:
-            try:
-                os.remove(IDENTITY)
-            except OSError:
-                pass
+            forget(IDENTITY)
             print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
             do_join(obj["name"])
             r = rpc(cmd, args, identity())
@@ -196,16 +222,7 @@ def main(argv):
     if verb == "join":
         do_join(" ".join(rest) or default_name())
     elif verb == "session-start":
-        # Fired by the claude-code SessionStart hook: silent no-ops by design.
-        if os.environ.get("BCT_PANE_ID"):
-            return                      # BCT pane — statusline auto-invite owns this
-        ensure_stable_copy()
-        if not sock_available():
-            return                      # no ssh session forwarding the socket
-        if identity() or load(PENDING):
-            claim_pending()
-            return                      # already joined / already requested
-        do_join(default_name(), wait_approval=False)
+        session_start()
     elif verb == "send":
         msg = " ".join(rest)
         if not msg:
@@ -243,10 +260,7 @@ def main(argv):
     elif verb == "leave":
         r = rpc("chat-leave", [], identity())
         for p in (IDENTITY, PENDING):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+            forget(p)
         if not r.get("ok") and r.get("error") != NOT_INVITED:
             die(r.get("error", "error"))
     else:
