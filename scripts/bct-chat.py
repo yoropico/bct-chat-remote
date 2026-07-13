@@ -8,7 +8,7 @@ control socket; override with $BCT_CHAT_SOCK). On hosts without AF_UNIX
 $BCT_CHAT_SOCK=tcp:<host>:<port>. Pure stdlib.
 Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
-import json, os, socket, sys, time
+import json, os, socket, subprocess, sys, time
 
 if hasattr(sys.stdout, "reconfigure"):
     # Wire and room text are UTF-8; never trust the locale (Korean Windows = cp949).
@@ -23,6 +23,10 @@ JOIN_COOLDOWN = 1800            # 30 min — a request the user denied or ignore
 SOCK = os.environ.get("BCT_CHAT_SOCK", os.path.expanduser("~/.bct-chat.sock"))
 NO_NEW = "(새 메시지 없음)"
 NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
+SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
+PIDFILE = os.path.join(STATE_DIR, "heartbeat.pid")
+HEARTBEAT_INTERVAL = 240        # 4 min — comfortably inside BCT's 10-min prune window
+HEARTBEAT_MAX_UPTIME = 43200    # 12 h — backstop for a marker leaked by a crashed session
 
 
 def tcp_target(spec):
@@ -192,6 +196,95 @@ def claim_pending():
     return False
 
 
+def mark_session(sid):
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    open(os.path.join(SESSIONS_DIR, sid), "w").close()
+
+
+def unmark_session(sid):
+    forget(os.path.join(SESSIONS_DIR, sid))
+
+
+def live_sessions():
+    """One marker per live claude session on this host — the daemon's refcount."""
+    try:
+        return os.listdir(SESSIONS_DIR)
+    except OSError:
+        return []
+
+
+def heartbeat_alive():
+    """Is a daemon running? Its pid file's mtime is refreshed every tick, so a stale
+    file (crashed daemon) ages out. NEVER probe the pid with os.kill(pid, 0) — on
+    Windows that TERMINATES the process."""
+    try:
+        return time.time() - os.stat(PIDFILE).st_mtime < 2 * HEARTBEAT_INTERVAL
+    except OSError:
+        return False
+
+
+def spawn_heartbeat():
+    if heartbeat_alive():
+        return
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "heartbeat"], **kwargs)
+    except OSError:
+        pass                        # best-effort; never block session start
+
+
+def pidfile_owner():
+    try:
+        with open(PIDFILE, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def do_heartbeat(interval, max_uptime):
+    """Prove this host is alive while any claude session on it is. BCT prunes an
+    external after 10 min of silence and (before the retire/reseat change) that
+    destroyed its unread cursor — so a live-but-quiet host must keep ticking."""
+    if heartbeat_alive() and pidfile_owner() != os.getpid():
+        return                      # another daemon has it
+    me = os.getpid()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(PIDFILE, "w", encoding="utf-8") as f:
+        f.write(str(me))
+    started = time.time()
+    fails = 0
+    while True:
+        if not live_sessions():
+            break                   # every claude on this host is gone — get out of the way
+        if time.time() - started > max_uptime:
+            break                   # leaked marker backstop
+        if pidfile_owner() not in (me, 0):
+            break                   # a newer daemon took over
+        os.utime(PIDFILE, None)     # liveness for heartbeat_alive()
+        if not sock_available():
+            fails += 1
+        else:
+            r = rpc("chat-list", [], identity())        # read-only: its only job is touch()
+            if not r.get("ok") and r.get("error") == NOT_INVITED:
+                obj = load(IDENTITY)
+                request_join_if_allowed(obj["name"] if obj else default_name())
+                fails = 0
+            elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
+                fails += 1
+            else:
+                fails = 0
+                claim_pending()      # an approval may have landed since the last tick
+        if fails >= 2:
+            break                   # tunnel is down; the next session start respawns us
+        time.sleep(interval)
+    forget(PIDFILE)
+
+
 def do_join(name, wait_approval=True):
     r = rpc("chat-join", [name])
     if not r.get("ok"):
@@ -300,6 +393,13 @@ def main(argv):
             forget(p)
         if not r.get("ok") and r.get("error") != NOT_INVITED:
             die(r.get("error", "error"))
+    elif verb == "heartbeat":
+        interval, max_uptime = HEARTBEAT_INTERVAL, HEARTBEAT_MAX_UPTIME
+        if "--interval" in rest:
+            interval = float(rest[rest.index("--interval") + 1])
+        if "--max-uptime" in rest:
+            max_uptime = float(rest[rest.index("--max-uptime") + 1])
+        do_heartbeat(interval, max_uptime)
     else:
         die(f"unknown verb: {verb}")
 
