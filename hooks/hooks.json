@@ -10,6 +10,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/bct-chat.py\" session-end || python \"${CLAUDE_PLUGIN_ROOT}/scripts/bct-chat.py\" session-end",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

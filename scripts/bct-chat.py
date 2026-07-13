@@ -325,21 +325,45 @@ def do_join(name, wait_approval=True):
     die("승인 대기 시간 초과")
 
 
+def hook_session_id():
+    """claude-code pipes the hook payload as JSON on stdin. An interactive run has a
+    tty there — never block on it."""
+    try:
+        if sys.stdin is None or sys.stdin.isatty():
+            return ""
+        return str(json.loads(sys.stdin.read() or "{}").get("session_id", ""))
+    except (OSError, ValueError):
+        return ""
+
+
 def session_start():
-    """SessionStart hook: silent no-ops by design, but never silently absent —
-    if the room no longer knows us, raise a fresh join request."""
+    """SessionStart hook: silent no-ops by design, but never silently absent — if the
+    room no longer knows us, raise a fresh join request (cooldown permitting), and keep
+    a heartbeat running for as long as this host has a live claude session."""
     if os.environ.get("BCT_PANE_ID"):
         return                      # BCT pane — statusline auto-invite owns this
     ensure_stable_copy()
+    sid = hook_session_id()
     if not sock_available():
         return                      # no ssh session forwarding the socket
+    if sid:
+        mark_session(sid)           # before spawning: the daemon exits on an empty set
     if load(PENDING):
         claim_pending()
-        return                      # approved just now, or still awaiting the user
-    if identity() and membership_live():
-        return
-    obj = load(IDENTITY)
-    request_join_if_allowed(obj["name"] if obj else default_name())
+    elif not (identity() and membership_live()):
+        obj = load(IDENTITY)
+        request_join_if_allowed(obj["name"] if obj else default_name())
+    if sid:
+        spawn_heartbeat()
+
+
+def session_end():
+    """SessionEnd hook: drop this session's marker. The daemon is NOT killed — another
+    claude session on this host may still be in the room; it exits on its own once the
+    marker set empties."""
+    sid = hook_session_id()
+    if sid:
+        unmark_session(sid)
 
 
 def authed(cmd, args):
@@ -372,6 +396,8 @@ def main(argv):
         do_join(" ".join(rest) or default_name())
     elif verb == "session-start":
         session_start()
+    elif verb == "session-end":
+        session_end()
     elif verb == "send":
         msg = " ".join(rest)
         if not msg:
