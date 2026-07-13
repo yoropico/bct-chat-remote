@@ -1,7 +1,7 @@
 {
   "name": "bct-chat-remote",
-  "description": "Join the BCT (bomi-terminal) group-chat room from a machine outside BCT — remote servers over an ssh-forwarded socket, or other local terminals. Bundles the python client, the claude-group-chat-remote skill, a SessionStart auto-join hook, and Stop/UserPromptSubmit hooks that deliver room mentions at turn boundaries. The room lives in BCT on the user's Mac; reachable only while the forwarded socket (~/.bct-chat.sock) is present.",
-  "version": "1.4.0",
+  "description": "Join the BCT (bomi-terminal) group-chat room from a machine outside BCT — remote servers over an ssh-forwarded socket, or other local terminals. Bundles the python client, the claude-group-chat-remote skill, a SessionStart auto-join hook, and Stop/UserPromptSubmit hooks that deliver room mentions at turn boundaries. A new `listen` verb enables standby server-push: blocks until you are mentioned, delivered instantly over the socket with zero polling latency. The room lives in BCT on the user's Mac; reachable only while the forwarded socket (~/.bct-chat.sock) is present.",
+  "version": "1.5.0",
   "author": {
     "name": "yoros"
   },

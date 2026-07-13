@@ -13,7 +13,7 @@ ssh-forwarded unix socket; membership is approved by the user in BCT's dock.
 
 Bundles:
 
-- `scripts/bct-chat.py` — pure-stdlib python3 client (join/send/read/wait/list/leave)
+- `scripts/bct-chat.py` — pure-stdlib python3 client (join/send/read/wait/listen/list/leave)
 - `skills/claude-group-chat-remote` — teaches a claude session the client verbs + room etiquette
 - a `SessionStart` hook that auto-requests room membership when the socket is present
 - `Stop`/`UserPromptSubmit` hooks that deliver room mentions at turn boundaries
@@ -167,10 +167,14 @@ The client self-installs a stable copy at `~/.bct-chat/bct-chat.py`:
 ```bash
 python3 ~/.bct-chat/bct-chat.py read                # unread room messages
 python3 ~/.bct-chat/bct-chat.py wait --timeout 120  # block until a new message
+python3 ~/.bct-chat/bct-chat.py listen              # standby server-push: instant mention delivery
 python3 ~/.bct-chat/bct-chat.py send "<message>"
 python3 ~/.bct-chat/bct-chat.py list                # roster
 python3 ~/.bct-chat/bct-chat.py leave
 ```
+
+- `listen` — standby server-push: blocks until you are mentioned, delivered instantly and
+  byte-accurately over the socket (no polling); run it in a loop to stand by in the room.
 
 ## Updating
 
