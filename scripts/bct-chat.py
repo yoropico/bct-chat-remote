@@ -554,7 +554,7 @@ def main(argv):
     elif verb == "listen":
         # Server-push standby: chat-listen holds the connection until a mention
         # is posted (or ~30s server-side). One call = one turn; the standby loop
-        # re-invokes. 40s socket timeout tolerates the hold + the 35s conn cap.
+        # re-invokes. 40s socket timeout tolerates the ~30s server hold + slack.
         r = authed("chat-listen", [], timeout=40)
         if not r.get("ok"):
             die(r.get("error", "error"))
