@@ -166,14 +166,13 @@ def identity():
 
 def membership_live():
     """Does BCT still know this identity? A BCT restart resets the room, but
-    identity.json outlives it — so ask the bridge, never trust the file. Drops
-    the dead identity so the caller can re-request. Any other error (bridge
-    hiccup) counts as live: better silent than a spurious join banner."""
-    r = rpc("chat-list", [], identity())          # read-only probe; consumes no messages
-    if r.get("ok") or r.get("error") != NOT_INVITED:
-        return True
-    forget(IDENTITY)
-    return False
+    identity.json outlives it — so ask the bridge, never trust the file. The dead
+    identity is KEPT (it only ever earns NOT_INVITED, the rejoin needs the name
+    beside it, and the heartbeat needs something to send); a new approval
+    overwrites it. Any other error (bridge hiccup) counts as live: better silent
+    than a spurious join banner."""
+    r = rpc("chat-list", [], identity())      # read-only probe; consumes no messages
+    return r.get("ok") or r.get("error") != NOT_INVITED
 
 
 def claim_pending():
@@ -227,20 +226,22 @@ def session_start():
         return                      # approved just now, or still awaiting the user
     if identity() and membership_live():
         return
-    request_join_if_allowed(default_name())
+    obj = load(IDENTITY)
+    request_join_if_allowed(obj["name"] if obj else default_name())
 
 
 def authed(cmd, args):
-    """RPC with identity; auto re-join on identity invalidation (BCT restart/kick)."""
+    """RPC with identity; auto re-join on identity invalidation (BCT restart/eviction)."""
     if not identity():
         claim_pending()
     r = rpc(cmd, args, identity())
     if not r.get("ok") and r.get("error") == NOT_INVITED:
         obj = load(IDENTITY)
         if obj:
-            forget(IDENTITY)
+            if not may_request_join():
+                return r                      # cooling down — surface NOT_INVITED as-is
             print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
-            do_join(obj["name"])
+            do_join(obj["name"])              # blocking: a live verb wants an answer
             r = rpc(cmd, args, identity())
     return r
 
