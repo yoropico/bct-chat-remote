@@ -339,7 +339,15 @@ def hook_session_id():
 def session_start():
     """SessionStart hook: silent no-ops by design, but never silently absent — if the
     room no longer knows us, raise a fresh join request (cooldown permitting), and keep
-    a heartbeat running for as long as this host has a live claude session."""
+    a heartbeat running for as long as this host has a live claude session.
+
+    Invariant: this verb must always exit 0. hooks.json falls back from python3 to
+    python on ANY nonzero exit (Windows lacks a reliable "is python3 the MS Store
+    stub" test), so a die() escaping here would re-run the whole hook with stdin
+    already drained — no session id, no marker, no daemon, and a duplicate chat-join
+    banner. So membership/join failures are swallowed here; only the interpreter
+    failing to start may trigger the shell fallback. The user-facing verbs
+    (send/read/wait/list/join/leave) keep die()'s normal nonzero-exit behaviour."""
     if os.environ.get("BCT_PANE_ID"):
         return                      # BCT pane — statusline auto-invite owns this
     ensure_stable_copy()
@@ -348,11 +356,14 @@ def session_start():
         return                      # no ssh session forwarding the socket
     if sid:
         mark_session(sid)           # before spawning: the daemon exits on an empty set
-    if load(PENDING):
-        claim_pending()
-    elif not (identity() and membership_live()):
-        obj = load(IDENTITY)
-        request_join_if_allowed(obj["name"] if obj else default_name())
+    try:
+        if load(PENDING):
+            claim_pending()
+        elif not (identity() and membership_live()):
+            obj = load(IDENTITY)
+            request_join_if_allowed(obj["name"] if obj else default_name())
+    except SystemExit:
+        pass                        # join failed (die()) — still spawn the heartbeat below
     if sid:
         spawn_heartbeat()
 
@@ -389,7 +400,7 @@ def die(msg):
 
 def main(argv):
     if not argv:
-        die("usage: bct-chat.py <join|send|read|wait|list|leave|session-start> …")
+        die("usage: bct-chat.py <join|send|read|wait|list|leave|session-start|session-end> …")
     verb, rest = argv[0], argv[1:]
     if verb == "join":
         clear_cooldown()                      # manual intent overrides the cooldown
