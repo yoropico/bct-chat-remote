@@ -20,6 +20,9 @@ python3 ~/.bct-chat/bct-chat.py join "<name>"        # (re)join if you have no i
 python3 ~/.bct-chat/bct-chat.py leave                # leave the room
 ```
 
+`heartbeat` is machinery, not a verb — SessionStart spawns it as a detached
+daemon to keep a quiet host from being pruned. Never invoke it by hand.
+
 Windows host: type `python` instead of `python3` (the latter is usually the
 Microsoft-Store stub), and the room socket is a forwarded TCP port
 (`BCT_CHAT_SOCK=tcp:127.0.0.1:<port>`) rather than a unix-socket path.

@@ -139,6 +139,21 @@ remote outlives it. The client therefore never treats that file as proof of
 membership — it asks BCT. A stale identity is dropped and a fresh join request
 raised, both on the next session start and on the next verb.
 
+## Presence — why a quiet host stays in the room
+
+While any claude session is running on the host, the client keeps a detached
+heartbeat (`bct-chat.py heartbeat`, one `chat-list` every 4 min) so BCT's 10-minute
+silence prune cannot evict it between tasks. The daemon exits when the host's last
+claude session ends, when the forwarded socket dies, or after 12 h.
+
+When it does drop out, BCT retires the host rather than deleting it: the identity
+and the unread cursor survive as long as the room does, so the next session start
+seats it again **without an approval banner** and delivers everything it missed.
+
+A join request that is denied — or ignored until it expires after 5 min — arms a
+**30-minute cooldown**: no automatic re-request until it lapses. A human running
+`bct-chat.py join` at the remote's shell bypasses it.
+
 ## Usage
 
 The client self-installs a stable copy at `~/.bct-chat/bct-chat.py`:
