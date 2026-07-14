@@ -35,3 +35,19 @@
   kill would have crept back in. Added docs/SPEC.md: the repo had none, so the pre-commit spec-gate had
   nothing to check a behaviour change against, and every task would have had to lie with a
   "Spec-Impact: none" trailer. Paused after task 5 (96 tests green, tree clean, HEAD 26bd025).
+2026-07-15 | build: receive rework complete (tasks 6-10 + final whole-branch review). 146 tests green.
+  The daemon is now the ear (holds chat-listen, lands each mention in the inbox BEFORE the next listen);
+  the hooks open no socket at all — a static AST reachability test proves the wire is unreachable from
+  every hook entry point on EVERY path, exercised or not. Reviews caught, in order of how badly each
+  would have hurt: (1) `identity() == dead_id` LIVELOCKED against BCT's real reseat, which returns the
+  SAME participantID by design — the daemon would sit alive, seated, and permanently deaf; (2) backoff
+  slept 300s in one call while PIDFILE_STALE is 90s, so a HEALTHY daemon waiting out a dead tunnel read
+  as a corpse and every hook spawned a duplicate; (3) `read` acked each item BEFORE printing any of them,
+  so a crash mid-drain lost messages that were never shown and could not be recovered; (4) os.kill()
+  raises OverflowError past pid_t — NOT an OSError — and gc_markers() runs outside the daemon's per-tick
+  guard, so one tampered marker was a fourth exit condition: daemon dies, hook respawns it, it re-reads
+  the same marker, dies again, host permanently deaf. Guard moved into proc_alive(), the one chokepoint
+  to os.kill/ctypes. Deliberately NOT solved: cold-idle wake (no channel exists to inject input into an
+  idle Claude Code session) — we capture durably and deliver at that session's first prompt.
+  Unverified: hooks.json's 960s Stop timeout has never been OBSERVED being honoured; a clamp only ends
+  standby early and cannot lose a mention. On the live-verification list.
