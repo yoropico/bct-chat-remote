@@ -203,6 +203,20 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(swept, [], "the live sidecar was swept out from under the steal")
         self.assertEqual(n, 7)
 
+    def test_a_tampered_sidecar_pid_does_not_break_the_sweep(self):
+        # The digit bound in the sweep regex does NOT make this safe — the OverflowError
+        # boundary (2147483647) sits inside any 10-digit range. proc_alive()'s pid_t range
+        # check is what keeps this from raising out of recover_orphans() and into a hook,
+        # which would swallow it and silently deliver nothing.
+        os.makedirs(self.mod.PROCESSING_DIR, exist_ok=True)
+        planted = os.path.join(self.mod.PROCESSING_DIR, "x.9999999999.tmp")
+        open(planted, "w").close()
+        old = time.time() - self.mod.ORPHAN_AGE - 10
+        os.utime(planted, (old, old))
+        self.mod.inbox_put("still delivered", "svr")
+        self.assertEqual(self.mod.recover_orphans(), 0)          # no raise
+        self.assertEqual(self.mod.inbox_claim()[1]["text"], "still delivered")
+
     def test_sweep_skips_a_sidecar_whose_owner_pid_is_still_alive(self):
         # Pins the pid guard directly, independent of any timing/injection trickery:
         # a sidecar named with a LIVE pid must survive the sweep no matter how old

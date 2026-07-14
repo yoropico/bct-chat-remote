@@ -209,11 +209,11 @@ readers of this queue: no socket, no RPC.
   closes the race. Once the owner is confirmed dead, `ORPHAN_AGE` is still
   checked as a second, independent condition — not as a defense against pid
   recycling, which can't cause a wrong delete: a recycled pid reads as alive
-  and only DELAYS cleanup, it never triggers an early one. Every sidecar's pid
-  is bounded to 10 digits in the sweep regex — a hand-planted absurd pid (e.g.
-  `x.99999999999999999999.tmp`) would otherwise reach `os.kill()` and raise
-  `OverflowError`, which is not an `OSError` and so is not caught by
-  `proc_alive()`'s guard, propagating out of the sweep.
+  and only DELAYS cleanup, it never triggers an early one. A pid parsed out of a
+  filename is never trusted as a number either: `proc_alive()` returns False for
+  anything outside `pid_t` (see §10), because `os.kill()` raises `OverflowError`
+  there — not an `OSError` — and that would propagate out of the sweep and out of
+  `gc_markers()`, which the daemon calls outside its per-tick guard.
 
 ## 7. Presence — the daemon is the ear
 

@@ -49,6 +49,15 @@ class StateTests(unittest.TestCase):
         self.assertFalse(self.mod.proc_alive(0))
         self.assertFalse(self.mod.proc_alive(-1))
 
+    def test_proc_alive_is_false_past_pid_t_instead_of_raising(self):
+        # os.kill() raises OverflowError past pid_t, and Windows' DWORD marshalling raises
+        # ctypes.ArgumentError — NEITHER is an OSError, so neither of proc_alive()'s except
+        # clauses would catch it. The escape route matters: gc_markers() calls proc_alive()
+        # OUTSIDE the daemon's per-tick guard, so one tampered marker would kill the daemon
+        # on every respawn and the host would go permanently deaf.
+        for pid in (2 ** 31, 2 ** 32 - 1, 9999999999):
+            self.assertFalse(self.mod.proc_alive(pid), pid)
+
     def test_proc_alive_does_not_use_os_kill_on_windows(self):
         # CPython's os.kill on Windows calls TerminateProcess for ANY signal.
         real_name = os.name

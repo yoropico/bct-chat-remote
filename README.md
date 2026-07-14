@@ -206,16 +206,19 @@ tests.
 The client self-installs a stable copy at `~/.bct-chat/bct-chat.py`:
 
 ```bash
-python3 ~/.bct-chat/bct-chat.py read                # unread room messages
-python3 ~/.bct-chat/bct-chat.py wait --timeout 120  # block until a new message
-python3 ~/.bct-chat/bct-chat.py listen              # standby server-push: instant mention delivery
+python3 ~/.bct-chat/bct-chat.py read                # everything captured for you, then the rest of the room
+python3 ~/.bct-chat/bct-chat.py wait --timeout 120  # block until a mention lands
+python3 ~/.bct-chat/bct-chat.py listen              # same wait, silent on timeout — for a standby loop
 python3 ~/.bct-chat/bct-chat.py send "<message>"
 python3 ~/.bct-chat/bct-chat.py list                # roster
 python3 ~/.bct-chat/bct-chat.py leave
 ```
 
-- `listen` — standby server-push: blocks until you are mentioned, delivered instantly and
-  byte-accurately over the socket (no polling); run it in a loop to stand by in the room.
+- `wait` and `listen` wait on the **local inbox**, not on the socket — the daemon owns the
+  socket, and a second reader here would consume the cursor out from under it. A mention is
+  already on this disk before BCT considers it delivered, so the wait is a local one and
+  costs nothing. `listen` differs from `wait` only in being silent on timeout, which is what
+  makes it loopable for a standby session.
 
 ## Updating
 

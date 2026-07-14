@@ -224,10 +224,21 @@ def forget(path):
         pass
 
 
+PID_MAX = 2 ** 31 - 1           # pid_t is a signed 32-bit int; a DWORD on Windows
+
+
 def proc_alive(pid):
     """Is this pid a live process? NEVER os.kill(pid, 0) on Windows — CPython maps
-    os.kill to TerminateProcess there for ANY signal, i.e. probing would kill it."""
-    if not pid or pid <= 0:
+    os.kill to TerminateProcess there for ANY signal, i.e. probing would kill it.
+
+    The range check is load-bearing, not defensive tidiness: a pid past pid_t makes
+    os.kill raise OverflowError, and Windows' DWORD marshalling raise
+    ctypes.ArgumentError — NEITHER of which is an OSError, so neither except clause
+    below would catch it. The exception would then escape into gc_markers(), which
+    the daemon calls OUTSIDE its per-tick guard: one tampered marker file would kill
+    the daemon on every respawn, and the host would go permanently deaf while every
+    hook cheerfully swallowed the same error."""
+    if not pid or pid <= 0 or pid > PID_MAX:
         return False
     if os.name == "nt":
         # AttributeError/ImportError/OSError all mean "could not ask" here — never
@@ -468,11 +479,11 @@ def inbox_ack(path):
 
 
 _SIDECAR_RE = re.compile(r"\.(\d{1,10})\.(?:evict|claim|bump|tmp)$")
-# Digits bounded to 10: a real pid is never anywhere near that long (Linux's pid_max
-# tops out at 4194304, 7 digits), but an unbounded \d+ would match a hand-planted
-# absurd pid (e.g. "x.99999999999999999999.tmp") and hand it to int() -> os.kill(),
-# which raises OverflowError, not OSError — proc_alive()'s guard only catches OSError
-# subclasses, so that error would propagate out of the sweep instead of reading as dead.
+# The digit bound keeps int() cheap; it is NOT what makes a hand-planted absurd pid
+# safe. It cannot be: the OverflowError boundary (2147483647) sits INSIDE any 10-digit
+# range, so a bounded regex still admits pids that would blow up os.kill(). The real
+# guard is proc_alive()'s explicit PID_MAX range check, which returns False for
+# anything outside pid_t instead of raising something no caller catches.
 
 
 def _sweep_sidecars(d, now):

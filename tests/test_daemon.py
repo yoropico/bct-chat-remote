@@ -296,6 +296,22 @@ class DaemonTests(unittest.TestCase):
         self.mod.rpc = lambda *a, **k: self.fail("a daemon the user left must not tick")
         self.mod.do_daemon(presence_interval=0.01, listen_timeout=1)
 
+    def test_a_tampered_marker_pid_cannot_kill_the_daemon(self):
+        # gc_markers() runs OUTSIDE the daemon's per-tick guard, so anything it raises is a
+        # FOURTH exit condition. A pid past pid_t makes os.kill() raise OverflowError — not an
+        # OSError, so proc_alive()'s guard would not have caught it: the daemon would die on
+        # every respawn, re-reading the same marker, and the host would go permanently deaf
+        # while every hook silently swallowed the same error.
+        self.mod.save(os.path.join(self.mod.SESSIONS_DIR, "tampered"),
+                      {"pid": 9999999999, "startedAt": time.time()})
+        # It reads as dead and is collected — which is right, since no live session can own a
+        # pid past pid_t. What matters is that it is ANSWERED rather than raised.
+        self.assertEqual(self.mod.gc_markers(), 1)
+        self.assertNotIn("tampered", self.mod.live_sessions())
+        self.scripted_rpc({"chat-listen": {"ok": True, "text": self.mod.NO_MENTION}},
+                          stop_after=2)
+        self.mod.do_daemon(presence_interval=999, listen_timeout=1)   # must not raise
+
     def test_gc_removes_a_crashed_sessions_marker(self):
         # A reaped pid, not the constant 999999 — Linux's default pid_max (4194304) makes
         # 999999 an ordinary, possibly-live pid there (macOS caps at 99999).

@@ -115,11 +115,11 @@ def inbox_ack(path):
 
 
 _SIDECAR_RE = re.compile(r"\.(\d{1,10})\.(?:evict|claim|bump|tmp)$")
-# Digits bounded to 10: a real pid is never anywhere near that long (Linux's pid_max
-# tops out at 4194304, 7 digits), but an unbounded \d+ would match a hand-planted
-# absurd pid (e.g. "x.99999999999999999999.tmp") and hand it to int() -> os.kill(),
-# which raises OverflowError, not OSError — proc_alive()'s guard only catches OSError
-# subclasses, so that error would propagate out of the sweep instead of reading as dead.
+# The digit bound keeps int() cheap; it is NOT what makes a hand-planted absurd pid
+# safe. It cannot be: the OverflowError boundary (2147483647) sits INSIDE any 10-digit
+# range, so a bounded regex still admits pids that would blow up os.kill(). The real
+# guard is proc_alive()'s explicit PID_MAX range check, which returns False for
+# anything outside pid_t instead of raising something no caller catches.
 
 
 def _sweep_sidecars(d, now):
