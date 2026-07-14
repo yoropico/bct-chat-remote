@@ -25,3 +25,13 @@
   by a 7-day mtime TTL where we do not. Erring long is deliberate — a lingering marker costs a
   phantom seat, while GC'ing a LIVE session's marker would cost that session its ear.
   Plan: docs/superpowers/plans/2026-07-14-chat-remote-inbox-receive.md
+2026-07-14 | build: tasks 1-5 of the receive rework landed (subagent-driven, review after every task).
+  The reviews earned their keep — four defects that unit-green code was hiding: rpc()'s "overall
+  deadline" only covered recv, so a 2s request really took 3.9s; the inbox cap counted a message a hook
+  had ALREADY claimed as "dropped"; os.rename PRESERVES mtime, so a stolen sidecar was sweep-eligible
+  the instant it was born (a live hook's file could be deleted mid-operation) — closed by ownership
+  (proc_alive on the pid in the sidecar's name), not by a timing threshold; and the daemon hand-copied
+  the join guard sequence, which is precisely how the duplicate-chat-join defect this rework exists to
+  kill would have crept back in. Added docs/SPEC.md: the repo had none, so the pre-commit spec-gate had
+  nothing to check a behaviour change against, and every task would have had to lie with a
+  "Spec-Impact: none" trailer. Paused after task 5 (96 tests green, tree clean, HEAD 26bd025).
