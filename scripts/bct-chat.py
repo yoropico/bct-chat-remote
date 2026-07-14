@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+
+# ---- config ------------------------------------------------------------
 """bct-chat.py — external participant client for BCT's group chat.
 
 Speaks the line-JSON wire ({"paneID","cmd","args"} -> {"ok","text","error"})
@@ -9,6 +12,8 @@ $BCT_CHAT_SOCK=tcp:<host>:<port>. Pure stdlib.
 Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
 import json, os, re, socket, subprocess, sys, time
+
+ARTIFACT = os.path.abspath(__file__)   # the concatenated single file; what spawn_heartbeat re-execs
 
 if hasattr(sys.stdout, "reconfigure"):
     # Wire and room text are UTF-8; never trust the locale (Korean Windows = cp949).
@@ -28,6 +33,20 @@ SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
 PIDFILE = os.path.join(STATE_DIR, "heartbeat.pid")
 HEARTBEAT_INTERVAL = 240        # 4 min — comfortably inside BCT's 10-min prune window
 HEARTBEAT_MAX_UPTIME = 43200    # 12 h — backstop for a marker leaked by a crashed session
+
+STABLE = os.path.join(STATE_DIR, "bct-chat.py")
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
+              '(명단: `python3 ~/.bct-chat/bct-chat.py list`, 새 메시지 확인: '
+              '`python3 ~/.bct-chat/bct-chat.py read`)')
+
+
+# ---- wire --------------------------------------------------------------
+"""Wire transport: unix socket (or TCP fallback) connection to the BCT bridge."""
+import json, os, re, socket, subprocess, sys, time
+
 
 
 def tcp_target(spec):
@@ -86,6 +105,12 @@ def rpc(cmd, args, pane_id="", timeout=10):
         return {"ok": False, "error": f"socket error: {e}"}
 
 
+# ---- state -------------------------------------------------------------
+"""Local state: identity/pending/cooldown JSON files, the stable copy, session markers."""
+import json, os, re, socket, subprocess, sys, time
+
+
+
 def load(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -105,6 +130,56 @@ def forget(path):
         os.remove(path)
     except OSError:
         pass
+
+
+def ensure_stable_copy():
+    """Plugin installs live under a versioned cache path; keep one canonical
+    copy at ~/.bct-chat/bct-chat.py for the skill prose and manual use."""
+    me = os.path.abspath(__file__)
+    if me == os.path.abspath(STABLE):
+        return
+    try:
+        with open(me, encoding="utf-8") as f:
+            src = f.read()
+        try:
+            with open(STABLE, encoding="utf-8") as f:
+                if f.read() == src:
+                    return
+        except OSError:
+            pass
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STABLE, "w", encoding="utf-8") as f:
+            f.write(src)
+        os.chmod(STABLE, 0o755)
+    except OSError:
+        pass                        # best-effort; never block session start
+
+
+def mark_session(sid):
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    open(os.path.join(SESSIONS_DIR, sid), "w").close()
+
+
+def unmark_session(sid):
+    forget(os.path.join(SESSIONS_DIR, sid))
+
+
+def live_sessions():
+    """One marker per live claude session on this host — the daemon's refcount."""
+    try:
+        return os.listdir(SESSIONS_DIR)
+    except OSError:
+        return []
+
+
+# ---- inbox -------------------------------------------------------------
+"""Placeholder — populated by Task 4."""
+
+
+# ---- membership --------------------------------------------------------
+"""Join/cooldown/identity: requesting, polling and holding room membership."""
+import json, os, re, socket, subprocess, sys, time
+
 
 
 def cooldown_remaining():
@@ -136,32 +211,6 @@ def request_join_if_allowed(name):
         return False
     do_join(name, wait_approval=False)
     return True
-
-
-STABLE = os.path.join(STATE_DIR, "bct-chat.py")
-
-
-def ensure_stable_copy():
-    """Plugin installs live under a versioned cache path; keep one canonical
-    copy at ~/.bct-chat/bct-chat.py for the skill prose and manual use."""
-    me = os.path.abspath(__file__)
-    if me == os.path.abspath(STABLE):
-        return
-    try:
-        with open(me, encoding="utf-8") as f:
-            src = f.read()
-        try:
-            with open(STABLE, encoding="utf-8") as f:
-                if f.read() == src:
-                    return
-        except OSError:
-            pass
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(STABLE, "w", encoding="utf-8") as f:
-            f.write(src)
-        os.chmod(STABLE, 0o755)
-    except OSError:
-        pass                        # best-effort; never block session start
 
 
 def identity():
@@ -197,21 +246,47 @@ def claim_pending():
     return False
 
 
-def mark_session(sid):
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
-    open(os.path.join(SESSIONS_DIR, sid), "w").close()
+def do_join(name, wait_approval=True):
+    r = rpc("chat-join", [name])
+    if not r.get("ok"):
+        die(r.get("error", "join failed"))
+    req_id = r["text"]
+    save(PENDING, {"requestID": req_id, "name": name})
+    if not wait_approval:
+        print(f"join requested ({req_id}) — approve in the BCT chat dock", file=sys.stderr)
+        return
+    print("입장 요청됨 — BCT 채팅 도크에서 승인해 주세요 (5분 내)", file=sys.stderr)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(2)
+        if claim_pending():
+            print("입장 승인됨", file=sys.stderr)
+            return
+        if not os.path.exists(PENDING):
+            die("denied or expired")
+    die("승인 대기 시간 초과")
 
 
-def unmark_session(sid):
-    forget(os.path.join(SESSIONS_DIR, sid))
+def authed(cmd, args, timeout=10):
+    """RPC with identity; auto re-join on identity invalidation (BCT restart/eviction)."""
+    if not identity():
+        claim_pending()
+    r = rpc(cmd, args, identity(), timeout=timeout)
+    if not r.get("ok") and r.get("error") == NOT_INVITED:
+        obj = load(IDENTITY)
+        if obj:
+            if not may_request_join():
+                return r                      # cooling down — surface NOT_INVITED as-is
+            print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
+            do_join(obj["name"])              # blocking: a live verb wants an answer
+            r = rpc(cmd, args, identity(), timeout=timeout)
+    return r
 
 
-def live_sessions():
-    """One marker per live claude session on this host — the daemon's refcount."""
-    try:
-        return os.listdir(SESSIONS_DIR)
-    except OSError:
-        return []
+# ---- presence ----------------------------------------------------------
+"""Heartbeat daemon: proves this host is alive while any claude session on it is."""
+import json, os, re, socket, subprocess, sys, time
+
 
 
 def heartbeat_alive():
@@ -234,7 +309,7 @@ def spawn_heartbeat():
     else:
         kwargs["start_new_session"] = True
     try:
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "heartbeat"], **kwargs)
+        subprocess.Popen([sys.executable, ARTIFACT, "heartbeat"], **kwargs)
     except OSError:
         pass                        # best-effort; never block session start
 
@@ -311,28 +386,10 @@ def do_heartbeat(interval, max_uptime):
             forget(PIDFILE)         # only ever release a pid file we still own
 
 
-def do_join(name, wait_approval=True):
-    r = rpc("chat-join", [name])
-    if not r.get("ok"):
-        die(r.get("error", "join failed"))
-    req_id = r["text"]
-    save(PENDING, {"requestID": req_id, "name": name})
-    if not wait_approval:
-        print(f"join requested ({req_id}) — approve in the BCT chat dock", file=sys.stderr)
-        return
-    print("입장 요청됨 — BCT 채팅 도크에서 승인해 주세요 (5분 내)", file=sys.stderr)
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        time.sleep(2)
-        if claim_pending():
-            print("입장 승인됨", file=sys.stderr)
-            return
-        if not os.path.exists(PENDING):
-            die("denied or expired")
-    die("승인 대기 시간 초과")
+# ---- delivery ----------------------------------------------------------
+"""Hook entry points: SessionStart/SessionEnd/Stop/UserPromptSubmit digest delivery."""
+import json, os, re, socket, subprocess, sys, time
 
-
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def hook_session_id():
@@ -420,27 +477,6 @@ def session_end():
             unmark_session(sid)
     except (Exception, SystemExit):
         pass
-
-
-def authed(cmd, args, timeout=10):
-    """RPC with identity; auto re-join on identity invalidation (BCT restart/eviction)."""
-    if not identity():
-        claim_pending()
-    r = rpc(cmd, args, identity(), timeout=timeout)
-    if not r.get("ok") and r.get("error") == NOT_INVITED:
-        obj = load(IDENTITY)
-        if obj:
-            if not may_request_join():
-                return r                      # cooling down — surface NOT_INVITED as-is
-            print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
-            do_join(obj["name"])              # blocking: a live verb wants an answer
-            r = rpc(cmd, args, identity(), timeout=timeout)
-    return r
-
-
-REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
-              '(명단: `python3 ~/.bct-chat/bct-chat.py list`, 새 메시지 확인: '
-              '`python3 ~/.bct-chat/bct-chat.py read`)')
 
 
 def compose_digest(name, read_text):
@@ -538,6 +574,12 @@ def prompt_submit_hook():
         pass
 
 
+# ---- cli ---------------------------------------------------------------
+"""Entry point: argv dispatch for the join/send/read/... verbs and hook shims."""
+import json, os, re, socket, subprocess, sys, time
+
+
+
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
@@ -629,7 +671,6 @@ def main(argv):
         do_heartbeat(interval, max_uptime)
     else:
         die(f"unknown verb: {verb}")
-
 
 if __name__ == "__main__":
     main(sys.argv[1:])
