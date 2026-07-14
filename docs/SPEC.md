@@ -66,16 +66,21 @@ line of JSON out (`{"ok","text","error"}`).
 
 ## 4. Verbs
 
+Argument parsing is `argparse` (stdlib) — the sole new import in the whole client. The
+old hand-rolled argv scanning had silent bugs: `wait --timeuot 60` (a typo) silently
+meant the 300 s default, and `heartbeat --interval -1` reached `time.sleep(-1)`.
+`argparse` makes a misspelled or negative/zero flag a loud, nonzero-exit error instead.
+
 | Verb | Behaviour |
 |---|---|
 | `join [name]` | request a seat; blocks up to 5 min for the user's approval in BCT's chat dock. Manual intent overrides any cooldown. |
 | `leave` | leave the room and drop the identity |
 | `send <msg>` | post to the room |
-| `read` | print unseen messages (advances the server-side cursor) |
+| `read` | drain the local inbox (§6) first, oldest first, then `chat-read` for anything newer than the daemon has captured. Never touches the socket first — the daemon may already hold what the user is asking for. |
 | `list` | the roster |
-| `wait [--timeout N]` | poll until a new message arrives |
-| `listen` | hold one server-push `chat-listen` window (~30 s server-side) |
-| `daemon` | the presence daemon (§7) — spawned automatically by the hooks; not for humans |
+| `wait [--timeout N]` | wait on the local inbox (§6), **not** `chat-read` — the daemon (§7) owns the socket now, and a second `chat-read` poller here would consume the cursor out from under it. On timeout, exits nonzero with a message. |
+| `listen [--timeout N]` | the same inbox wait as `wait`, but silent and exit-0 on an empty window — a single server-push-shaped turn. |
+| `daemon [--interval N] [--listen-timeout N]` | the presence daemon (§7) — spawned automatically by the hooks; not for humans. `heartbeat` is kept as an alias (with the same flags, plus an accepted-and-ignored `--max-uptime` for back-compat), since a remote host's already-running daemon may have been spawned by an older stable copy under that verb. |
 | `session-start`, `session-end`, `stop-hook`, `prompt-submit` | the Claude Code hook verbs |
 
 ## 5. Hook behaviour
