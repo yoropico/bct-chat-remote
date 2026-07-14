@@ -40,7 +40,14 @@ def build_artifact():
 def main(argv):
     text = build_artifact()
     if "--stdout" in argv:
-        sys.stdout.write(text)
+        # The artifact holds Korean strings; never trust the locale (same rule
+        # bctchat/config.py documents for the client itself — Windows defaults a text-mode
+        # stdout to cp1252/cp949, and encoding a Korean character there raises
+        # UnicodeEncodeError). Write raw UTF-8 bytes straight to the binary buffer: it
+        # sidesteps the locale entirely AND, being binary, never applies Windows'
+        # \n -> \r\n translation — so this path stays byte-identical to the file write
+        # below, whose open() already pins newline="\n".
+        sys.stdout.buffer.write(text.encode("utf-8"))
         return
     tmp = ARTIFACT + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as f:

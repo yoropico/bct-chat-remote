@@ -48,13 +48,20 @@ class FakeChatServer:
                         if not chunk:
                             break
                         buf += chunk
+                    if not buf.strip():
+                        continue                  # availability probe: connect+close
+                    req = json.loads(buf.decode())
+                    self.received.append(req)
+                    conn.sendall((json.dumps(self.handler(req)) + "\n").encode())
                 except OSError:
+                    # The recv() side already covered this; sendall() needs the same
+                    # guard. Windows resets the connection (WinError 10054,
+                    # ConnectionResetError — an OSError subclass) the instant a client
+                    # closes without draining the reply, and this is a daemon thread:
+                    # an uncaught exception here doesn't fail the run, but it does print
+                    # a traceback into otherwise-pristine test output. Either way the
+                    # peer is simply gone — nothing to fix, nothing to retry.
                     continue
-                if not buf.strip():
-                    continue                      # availability probe: connect+close
-                req = json.loads(buf.decode())
-                self.received.append(req)
-                conn.sendall((json.dumps(self.handler(req)) + "\n").encode())
 
     def close(self):
         self.sock.close()
@@ -137,7 +144,7 @@ class TcpTransportTests(unittest.TestCase):
             self.assertTrue(wait_for(lambda: os.path.exists(pending)),
                             "the daemon never requested a seat over TCP")
             self.assertIn("chat-join", [r["cmd"] for r in srv.received])
-            with open(pending) as f:
+            with open(pending, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["requestID"], "REQ-1")
         finally:
             reap_daemon(pidfile)

@@ -16,7 +16,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_heartbeat_helpers import (  # noqa: E402
-    CLIENT, load_fresh_module, reap_daemon, reaped_pid, wait_for,
+    CLIENT, load_fresh_module, proc_alive, reap_daemon, reaped_pid, wait_for,
 )
 
 
@@ -125,10 +125,12 @@ class SessionMarkerTests(unittest.TestCase):
         with open(self.pidfile, encoding="utf-8") as f:
             pid = int(f.read().strip())
         time.sleep(0.5)
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            self.fail("the daemon exited on a dead tunnel instead of backing off")
+        # NEVER os.kill(pid, 0) to probe liveness — CPython maps os.kill to
+        # TerminateProcess on Windows for ANY signal, so "probing" would kill the very
+        # daemon this assertion is trying to confirm is still alive. proc_alive() is
+        # the cross-platform liveness check this codebase uses everywhere else.
+        self.assertTrue(proc_alive(pid),
+                        "the daemon exited on a dead tunnel instead of backing off")
 
     def test_interactive_run_leaves_no_marker(self):
         r = run_hook("session-start", self.home, "tcp:127.0.0.1:1", "")
@@ -316,6 +318,10 @@ class ClaudePidTests(unittest.TestCase):
         self.mod.subprocess = FakeSub
         return calls
 
+    @unittest.skipIf(os.name == "nt",
+                     "posix-only: on nt, claude_pid() returns 0 before ever consulting "
+                     "the mocked ps, by design (see "
+                     "test_windows_resolves_no_pid_and_never_spawns_ps)")
     def test_a_live_claude_ancestor_is_trusted(self):
         self.install_ps(f"{os.getpid()}\n", "/usr/local/bin/node\n")
         self.assertEqual(self.mod.claude_pid(), os.getpid())

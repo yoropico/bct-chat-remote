@@ -85,7 +85,7 @@ class InboxTests(unittest.TestCase):
 
     def test_a_corrupt_item_is_dropped_not_returned(self):
         os.makedirs(self.mod.INBOX_DIR, exist_ok=True)
-        with open(os.path.join(self.mod.INBOX_DIR, "1-1.json"), "w") as f:
+        with open(os.path.join(self.mod.INBOX_DIR, "1-1.json"), "w", encoding="utf-8") as f:
             f.write("{not json")
         self.mod.inbox_put("good", "svr")
         path, item = self.mod.inbox_claim()

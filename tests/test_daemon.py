@@ -317,11 +317,11 @@ class DaemonTests(unittest.TestCase):
         # which gc_markers()/join_state()'s except tuples did not name. identity.json holding a
         # JSON list is truthy and reaches .get() -> AttributeError. All three run OUTSIDE the
         # daemon's per-tick guard, so each would have been a fourth exit condition.
-        with open(os.path.join(self.mod.SESSIONS_DIR, "inf"), "w") as f:
+        with open(os.path.join(self.mod.SESSIONS_DIR, "inf"), "w", encoding="utf-8") as f:
             f.write('{"pid": Infinity, "startedAt": 0}')
-        with open(self.mod.JOIN_STATE, "w") as f:
+        with open(self.mod.JOIN_STATE, "w", encoding="utf-8") as f:
             f.write('{"attempts": Infinity}')
-        with open(self.mod.IDENTITY, "w") as f:
+        with open(self.mod.IDENTITY, "w", encoding="utf-8") as f:
             f.write('["not", "a", "dict"]')
         self.mod.gc_markers()                       # must answer, not raise
         self.mod.join_state()

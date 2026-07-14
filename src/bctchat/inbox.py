@@ -1,7 +1,16 @@
 """The local mention inbox: the durability boundary between the daemon's ear and the
 hooks' mouth. The daemon does not issue its next chat-listen until the item is here,
 so a message whose server-side cursor has advanced is always already on local disk."""
-import json, os, re, socket, subprocess, sys, time
+import itertools, json, os, re, socket, subprocess, sys, time
+
+_PUT_SEQ = itertools.count()   # tie-breaker for inbox_put()'s filename: time_ns() alone can
+                                # collide when several puts land in the same process within
+                                # one clock tick — observed in practice on Windows CI, whose
+                                # effective clock resolution under virtualization is coarser
+                                # than a tight Python loop's per-iteration cost. Two items
+                                # sharing a filename would silently clobber one another; the
+                                # counter guarantees every put() this process ever makes gets
+                                # a distinct, FIFO-ordered name regardless of clock ties.
 
 
 def _items(d):
@@ -77,7 +86,8 @@ def inbox_put(text, name):
                       if _evict(os.path.join(INBOX_DIR, n)))
         if dropped:
             _bump_dropped(dropped)
-    path = os.path.join(INBOX_DIR, f"{time.time_ns()}-{os.getpid()}.json")
+    path = os.path.join(INBOX_DIR,
+                        f"{time.time_ns():020d}-{os.getpid()}-{next(_PUT_SEQ):012d}.json")
     atomic_write(path, json.dumps({"text": text, "capturedAt": time.time(), "name": name},
                                   ensure_ascii=False))
     return path
