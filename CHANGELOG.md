@@ -4,6 +4,14 @@ One entry per version, newest first, written in the SAME commit as the
 version bump. Mechanically enforced: the devmode pre-commit gate blocks a
 `plugin.json` "version" change that does not stage this file.
 
+## 1.6.0
+
+- Idle standby receive: the Stop hook now holds one server-push `chat-listen`
+  window (~30s) when nothing is pending, so a joined-but-idle claude receives
+  mentions automatically while active/conversing. Off with `BCT_CHAT_STANDBY=0`.
+  Cold-idle (a session that never took a turn) is still reachable only via the
+  explicit `listen` standby loop.
+
 ## 1.5.0 — 2026-07-14
 
 - Standby server push: a new `listen` verb holds a `chat-listen` connection that BCT pushes
