@@ -477,12 +477,41 @@ def pending_digest():
     return compose_digest(obj.get("name", default_name()), text)
 
 
+def standby_enabled():
+    """① idle standby window is ON unless BCT_CHAT_STANDBY is a disable value."""
+    v = os.environ.get("BCT_CHAT_STANDBY", "").strip().lower()
+    return v not in ("0", "off", "false", "no")
+
+
+def standby_listen_digest():
+    """Hold ONE server-push chat-listen window (~30s). Return the digest (wrapped
+    like pending_digest) if a mention was pushed, else None. Every failure path is
+    None — a hook must never disturb a turn."""
+    if os.environ.get("BCT_PANE_ID"):
+        return None
+    if not sock_available() or not identity():
+        return None
+    r = rpc("chat-listen", [], identity(), timeout=40)
+    if not r.get("ok"):
+        return None
+    text = r.get("text") or ""
+    if not text or text in (NO_NEW, NO_MENTION):
+        return None
+    obj = load(IDENTITY) or {}
+    return compose_digest(obj.get("name", default_name()), text)
+
+
 def stop_hook():
     """Stop hook: block the turn end with the digest when mentioned — claude
-    answers the room in place. Always exits 0 (see session_start docstring)."""
+    answers the room in place. When nothing is pending and standby is enabled, hold one
+    server-push window (~30s, ① idle standby) so an otherwise-idle joined claude still
+    receives. The window never blocks empty (sentinel → exit), so there is no turn
+    churn. Always exits 0 (see session_start docstring)."""
     drain_stdin()
     try:
         d = pending_digest()
+        if d is None and standby_enabled():
+            d = standby_listen_digest()
         if d:
             print(json.dumps({"decision": "block", "reason": d}, ensure_ascii=False))
     except (Exception, SystemExit):
