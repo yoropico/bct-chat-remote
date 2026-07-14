@@ -40,6 +40,8 @@ def take_dropped():
         os.rename(DROPPED, claim)
     except OSError:
         return 0
+    os.utime(claim, None)     # age it from the steal, not from dropped.json's last write —
+                               # see _sweep_sidecars: a rename keeps the source's old mtime
     obj = load(claim) or {}
     forget(claim)
     return int(obj.get("n", 0))
@@ -59,6 +61,8 @@ def _bump_dropped(n):
     try:
         os.rename(DROPPED, claim)
         stolen = True
+        os.utime(claim, None)  # age it from the steal, not from dropped.json's last
+                                # write — see _sweep_sidecars: a rename keeps the old mtime
         obj = load(claim) or {}
     except OSError:
         obj = {}
@@ -97,8 +101,14 @@ def inbox_claim():
             continue                    # another hook won it
         item = load(dst)
         if not isinstance(item, dict) or "text" not in item:
-            forget(dst)                 # corrupt: drop it, never hand it to claude
-            _bump_dropped(1)            # count it so it surfaces in the next digest
+            # Corrupt: drop it, never hand it to claude — but do NOT _bump_dropped()
+            # it. inbox_claim() runs from the hooks, the one place N processes really
+            # do run concurrently, and _bump_dropped()'s load-modify-save is only
+            # safe because the daemon is its single writer; counting from here would
+            # reopen the lost-update race that invariant exists to prevent. atomic_write
+            # means an item is never half-written, so a corrupt item needs disk damage
+            # or outside tampering — not worth trading that invariant for.
+            forget(dst)
             continue
         return (dst, item)
     return None
@@ -113,9 +123,24 @@ _SIDECAR_RE = re.compile(r"\.(?:evict|claim|bump|tmp)$")
 
 def _sweep_sidecars(d, now):
     """.evict/.claim/.bump/.tmp sidecars are left behind by a process that dies mid
-    rename-steal or mid atomic_write. _items() already ignores them (they don't end
-    in .json), so correctness never depends on this — but on a long-lived host they
-    would otherwise accumulate forever. Anything older than ORPHAN_AGE is stale."""
+    rename-steal or mid atomic_write; on a long-lived host they'd otherwise
+    accumulate forever, so anything older than ORPHAN_AGE is swept.
+
+    Correctness DOES depend on this staleness test, and on os.rename preserving the
+    source's mtime rather than resetting it: a .claim/.bump sidecar is born via
+    os.rename(DROPPED, claim), not a write, so without intervention it would inherit
+    dropped.json's old mtime — already stale the instant it's created, since
+    dropped.json can sit unwritten for minutes between drops. A concurrent sweep
+    could then delete a sidecar a live steal is still holding. take_dropped() and
+    _bump_dropped() guard against exactly this by calling os.utime(claim, None)
+    immediately after their steal rename, so a live sidecar's mtime reads as "now",
+    not as whenever dropped.json was last written — this sweep only ever removes one
+    that has genuinely sat abandoned for ORPHAN_AGE.
+
+    .evict sidecars need no such guard: _evict() never reads one back, so a sweep
+    that beats its forget() just makes that forget() a no-op — the True return still
+    correctly means "we really removed it". .tmp files are born from a real write,
+    so their mtime is genuine from the start."""
     try:
         names = os.listdir(d)
     except OSError:

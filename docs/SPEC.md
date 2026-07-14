@@ -129,7 +129,18 @@ readers of this queue: no socket, no RPC.
   version double-counts an item that `inbox_claim()` already delivered as also
   dropped. `take_dropped()` and the daemon's own counter bump race each other
   the same way, by the same primitive, so neither a concurrent reader nor a
-  concurrent bump can lose or double-report a count.
+  concurrent bump can lose or double-report a count. `dropped.json` has exactly
+  one writer (the daemon's cap eviction); a corrupt item found on claim is
+  discarded uncounted rather than bumping this counter from a hook, which would
+  reopen it to concurrent writers.
+- **Sidecar sweep**: `.claim`/`.bump`/`.evict`/`.tmp` files left by a process
+  that died mid rename-steal or mid atomic write are swept once older than
+  `ORPHAN_AGE`. A `.claim`/`.bump` sidecar is born by `os.rename`, which
+  preserves the source's mtime rather than resetting it, so `take_dropped()`
+  and the counter bump refresh it with `os.utime` immediately after the steal —
+  otherwise a `dropped.json` that sat unwritten past `ORPHAN_AGE` would hand a
+  freshly stolen sidecar a birth mtime that already reads as stale, and a
+  concurrently running sweep could delete it out from under the steal.
 
 ## 7. Presence
 

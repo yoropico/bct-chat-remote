@@ -53,10 +53,16 @@ class InboxTests(unittest.TestCase):
         self.assertIsNone(b)
 
     def test_inbox_claim_is_mutually_exclusive_under_thread_contention(self):
-        # The real regression guard for inbox_claim()'s concurrency contract: two
-        # threads released at the same instant onto the same one-item inbox. Not
-        # flaky — os.rename's exclusivity on a shared source either holds every
-        # time or the module's whole design is broken, so a single trial suffices.
+        # Two threads in ONE process, released at the same instant onto the same
+        # one-item inbox, pin the loser's arbitration path: os.rename raises for
+        # whichever thread loses the race, and it correctly walks away with None.
+        # That is a real and worthwhile contract, but it is not a stand-in for the
+        # cross-PROCESS os.rename exclusivity the module's design ultimately rests
+        # on — the GIL already serializes these two threads' rename calls at the C
+        # level, so this cannot observe two independent processes racing the same
+        # rename the way inbox_claim() is actually used in production. Not flaky —
+        # os.rename's exclusivity on a shared source either holds every time or the
+        # module's whole design is broken, so a single trial suffices.
         import threading
         self.mod.inbox_put("only-one", "svr")
         barrier = threading.Barrier(2)
@@ -148,8 +154,46 @@ class InboxTests(unittest.TestCase):
             self.mod._bump_dropped(5)
         finally:
             self.mod.load = real_load
+        self.assertTrue(fired, "the interleaving was never injected")
         taken.append(self.mod.take_dropped())
         self.assertEqual(sum(taken), 3 + 5)
+
+    def test_a_stolen_sidecar_survives_a_concurrent_sweep(self):
+        # Regression guard for the rename-preserves-mtime hazard: .claim/.bump
+        # sidecars are born via os.rename(DROPPED, claim), not a write, so they
+        # inherit dropped.json's mtime rather than getting a fresh one. If
+        # dropped.json sat untouched for a long time before the steal, the sidecar
+        # is already older than ORPHAN_AGE the instant it's created — so a
+        # recover_orphans() sweep running concurrently, in the window between the
+        # steal and its resolution, could delete it out from under the stealer and
+        # silently zero out the accumulated count. take_dropped() and
+        # _bump_dropped() guard against this with os.utime(claim, None) right after
+        # the steal rename. Pin the interleaving deterministically by hooking
+        # load() to run a sweep at the moment take_dropped() is mid-steal.
+        self.mod._bump_dropped(7)
+        old = time.time() - self.mod.ORPHAN_AGE - 500
+        os.utime(self.mod.DROPPED, (old, old))  # simulate dropped.json sitting untouched
+
+        state_dir = os.path.dirname(self.mod.DROPPED)
+        swept = []
+        real_load = self.mod.load
+
+        def hook(path):
+            result = real_load(path)
+            before = set(os.listdir(state_dir))
+            self.mod.recover_orphans()          # the concurrent sweep
+            after = set(os.listdir(state_dir))
+            swept.extend(before - after)
+            return result
+
+        self.mod.load = hook
+        try:
+            n = self.mod.take_dropped()
+        finally:
+            self.mod.load = real_load
+
+        self.assertEqual(swept, [], "the live sidecar was swept out from under the steal")
+        self.assertEqual(n, 7, "the count was lost when the sidecar was swept")
 
     def test_wait_returns_as_soon_as_an_item_lands(self):
         import threading
