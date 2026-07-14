@@ -12,7 +12,7 @@ def main(argv):
         die("usage: bct-chat.py <join|send|read|wait|listen|list|leave|session-start|session-end|stop-hook|prompt-submit> …")
     verb, rest = argv[0], argv[1:]
     if verb == "join":
-        clear_cooldown()                      # manual intent overrides the cooldown
+        clear_join_state()                    # manual intent always wins — clears a suspension too
         do_join(" ".join(rest) or default_name())
     elif verb == "session-start":
         session_start()
@@ -67,11 +67,7 @@ def main(argv):
             die(r.get("error", "error"))
         print(r.get("text", ""))
     elif verb == "leave":
-        r = rpc("chat-leave", [], identity())
-        for p in (IDENTITY, PENDING):
-            forget(p)
-        if not r.get("ok") and r.get("error") != NOT_INVITED:
-            die(r.get("error", "error"))
+        do_leave()
     elif verb == "heartbeat":
         interval, max_uptime = HEARTBEAT_INTERVAL, HEARTBEAT_MAX_UPTIME
         if "--interval" in rest:

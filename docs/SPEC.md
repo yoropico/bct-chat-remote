@@ -27,8 +27,8 @@ All under `~/.bct-chat/` (override the whole directory with `$BCT_CHAT_HOME`):
 | Path | Meaning |
 |---|---|
 | `identity.json` | `{"participantID", "name"}` — our seat in the room |
-| `pending-join.json` | an outstanding join request |
-| `join-cooldown.json` | when an automatic re-request is next allowed |
+| `pending-join.json` | an outstanding join request; discarded once older than `PENDING_TTL` |
+| `join-state.json` | `{"attempts", "nextAttemptAt", "suspended", "lastOutcome"}` — the join budget |
 | `sessions/<session-id>` | one marker per live claude session on this host (the daemon's refcount) |
 | `heartbeat.pid` | the presence daemon's pidfile; its mtime is the liveness signal |
 | `bct-chat.py` | the stable copy |
@@ -164,13 +164,36 @@ One daemon per host. It exists because BCT prunes an external participant after
 
 ## 8. Membership
 
-- The identity outlives a BCT restart, but BCT's memory of it does not — so
-  membership is probed on the wire (`chat-list`), never trusted from the file.
-- An automatic re-request is rate-limited by a 30-minute cooldown. A session
-  restart drops a cooldown armed by an *expiry* (fresh intent re-requests) but
-  never one armed by an explicit *denial* (no re-nag).
-- A `NOT_INVITED` reply to a user verb triggers one blocking re-join, then the
-  verb is retried.
+- The identity outlives a BCT restart, but BCT's memory of it does not — so a
+  dead-but-present `identity.json` is expected, and something on the wire (a
+  `NOT_INVITED` reply) is what has to notice it, never the file alone.
+- `ensure_membership()` is the **single** automatic-join entry point. Every
+  automatic caller (the SessionStart hook, the presence daemon, `authed()`'s
+  reactive re-join) goes through it, so a second `chat-join` can never fire
+  while one is already outstanding: an outstanding `pending-join.json` is
+  always polled (`chat-join-poll`), never re-requested.
+- `pending-join.json` retires on its own once older than `PENDING_TTL` (10
+  min) — not only on an `approved`/`denied`/`expired` reply. A reply the
+  client doesn't recognize (e.g. BCT restarted and forgot the request id) must
+  not wedge the file forever and make the rejoin branch unreachable.
+- The **join budget** (`join-state.json`) replaces the old flat 30-minute
+  cooldown. A `denied`/`expired` outcome backs off `60s → 300s → 1800s`
+  (`JOIN_BACKOFF`); after `JOIN_MAX_ATTEMPTS` (3) such outcomes the budget is
+  **suspended for good** — no automatic path asks again. Only a human running
+  `bct-chat.py join` at the remote's shell (`clear_join_state()`) resumes it;
+  an approval also clears the budget, since being seated makes the count
+  moot.
+- `leave` (`do_leave()`) drops the identity and the pending request, then
+  suspends the budget itself — this is what keeps a `leave` (or a kick) from
+  having the daemon re-request membership in the room the user just left. The
+  session markers (§2) are untouched: they track live claude sessions on this
+  host, which `leave` doesn't change.
+- A `NOT_INVITED` reply to a user verb (`authed()`) triggers one blocking
+  re-join through `ensure_membership(wait_approval=True)`, then the verb is
+  retried — unless the budget is suspended or backing off, in which case
+  `NOT_INVITED` is surfaced as-is. Success is decided by an identity now
+  existing, never by `pending-join.json` merely vanishing (the daemon polls
+  the same request and may legitimately claim the approval first).
 
 ## 9. Delivery format
 

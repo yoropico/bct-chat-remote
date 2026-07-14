@@ -26,8 +26,11 @@ if hasattr(sys.stdout, "reconfigure"):
 STATE_DIR = os.environ.get("BCT_CHAT_HOME") or os.path.expanduser("~/.bct-chat")
 IDENTITY = os.path.join(STATE_DIR, "identity.json")
 PENDING = os.path.join(STATE_DIR, "pending-join.json")
-COOLDOWN = os.path.join(STATE_DIR, "join-cooldown.json")
-JOIN_COOLDOWN = 1800            # 30 min — a request the user denied or ignored must not nag
+JOIN_STATE = os.path.join(STATE_DIR, "join-state.json")
+JOIN_BACKOFF = (60, 300, 1800)  # seconds: 1 min, 5 min, 30 min — then suspended for good
+JOIN_MAX_ATTEMPTS = 3           # denied/expired outcomes before the budget suspends itself
+PENDING_TTL = 600               # 10 min — an unrecognized poll reply (BCT forgot the request
+                                 # id) must still retire pending-join.json, not wedge it forever
 SOCK = os.environ.get("BCT_CHAT_SOCK", os.path.expanduser("~/.bct-chat.sock"))
 NO_NEW = "(새 메시지 없음)"
 NO_MENTION = "(새 멘션 없음)"          # chat-listen timeout sentinel (server push)
@@ -487,109 +490,158 @@ def inbox_wait(seconds, poll=1.0):
 
 
 # ---- membership --------------------------------------------------------
-"""Join/cooldown/identity: requesting, polling and holding room membership."""
+"""Membership: identity, the outstanding request, and the budget that decides whether
+we may ask again. ONE automatic-join entry point (ensure_membership) — the old code had
+three callers racing each other, and a second chat-join while one is outstanding orphans
+the approval the user is in the middle of granting."""
 import json, os, re, socket, subprocess, sys, time
 
 
-def cooldown_remaining():
-    """Seconds until an automatic join request is allowed again (0 = now)."""
-    obj = load(COOLDOWN)
-    if not obj:
-        return 0
-    left = JOIN_COOLDOWN - (time.time() - obj.get("lastFailedAt", 0))
-    return int(left) if left > 0 else 0
-
-
-def may_request_join():
-    return cooldown_remaining() == 0
-
-
-def note_join_failure(outcome):
-    save(COOLDOWN, {"lastFailedAt": time.time(), "outcome": outcome})
-
-
-def clear_cooldown():
-    forget(COOLDOWN)
-
-
-def request_join_if_allowed(name):
-    """Automatic (non-blocking) join request, gated by the cooldown. The manual
-    `join` verb bypasses this — a human at the remote's shell always wins."""
-    if not may_request_join():
-        print(f"입장 재요청 쿨다운 중 — {cooldown_remaining() // 60}분 후 재시도", file=sys.stderr)
-        return False
-    do_join(name, wait_approval=False)
-    return True
+def load_identity():
+    return load(IDENTITY)
 
 
 def identity():
-    obj = load(IDENTITY)
+    obj = load_identity()
     return obj.get("participantID", "") if obj else ""
 
 
-def membership_live():
-    """Does BCT still know this identity? A BCT restart resets the room, but
-    identity.json outlives it — so ask the bridge, never trust the file. The dead
-    identity is KEPT (it only ever earns NOT_INVITED, the rejoin needs the name
-    beside it, and the heartbeat needs something to send); a new approval
-    overwrites it. Any other error (bridge hiccup) counts as live: better silent
-    than a spurious join banner."""
-    r = rpc("chat-list", [], identity())      # read-only probe; consumes no messages
-    return r.get("ok") or r.get("error") != NOT_INVITED
+def join_state():
+    obj = load(JOIN_STATE)
+    if not isinstance(obj, dict):
+        return {"attempts": 0, "nextAttemptAt": 0, "suspended": False, "lastOutcome": ""}
+    return {"attempts": int(obj.get("attempts", 0)),
+            "nextAttemptAt": float(obj.get("nextAttemptAt", 0)),
+            "suspended": bool(obj.get("suspended", False)),
+            "lastOutcome": str(obj.get("lastOutcome", ""))}
+
+
+def clear_join_state():
+    forget(JOIN_STATE)
+
+
+def suspended():
+    return join_state()["suspended"]
+
+
+def may_request_join():
+    st = join_state()
+    return not st["suspended"] and time.time() >= st["nextAttemptAt"]
+
+
+def note_join_outcome(outcome):
+    """A refusal is information, not a reason to keep asking. Back off, then stop:
+    three denied/expired outcomes and we never ask again on our own — only a human
+    running `bct-chat.py join` at the remote's shell resumes it."""
+    st = join_state()
+    st["attempts"] += 1
+    st["lastOutcome"] = outcome
+    idx = min(st["attempts"], len(JOIN_BACKOFF)) - 1
+    st["nextAttemptAt"] = time.time() + JOIN_BACKOFF[idx]
+    st["suspended"] = st["attempts"] >= JOIN_MAX_ATTEMPTS
+    save(JOIN_STATE, st)
+
+
+def pending():
+    """The outstanding request, or None. A TTL — not the poll's reply — is what
+    ultimately retires it: an unrecognized error (BCT restarted and forgot the id)
+    used to wedge the file forever, and every auto-join caller prefers PENDING over
+    requesting, so the rejoin branch became unreachable (D6)."""
+    obj = load(PENDING)
+    if not isinstance(obj, dict) or "requestID" not in obj:
+        return None
+    if time.time() - float(obj.get("requestedAt", 0)) > PENDING_TTL:
+        forget(PENDING)
+        return None
+    return obj
 
 
 def claim_pending():
-    """If a session-start hook left a requestID, try to claim the identity."""
-    obj = load(PENDING)
+    obj = pending()
     if not obj:
         return False
     r = rpc("chat-join-poll", [obj["requestID"]])
     if r.get("ok") and (r.get("text") or "").startswith("approved\n"):
         save(IDENTITY, {"participantID": r["text"].split("\n", 1)[1], "name": obj["name"]})
         forget(PENDING)
-        clear_cooldown()                      # seated — the slate is clean
+        clear_join_state()                    # seated — the slate is clean
         return True
     if not r.get("ok") and r.get("error") in ("denied", "expired"):
         forget(PENDING)
-        note_join_failure(r["error"])         # arm the 30-min cooldown
+        note_join_outcome(r["error"])
     return False
+
+
+def ensure_membership(wait_approval=False):
+    """The ONLY automatic path into the room. Returns True if we are seated or a request
+    is now outstanding."""
+    if identity() and not wait_approval:
+        return True
+    if pending():
+        return claim_pending() or True        # a request is in flight: poll it, never re-ask
+    if not may_request_join():
+        return False
+    obj = load_identity()
+    do_join(obj["name"] if obj else default_name(), wait_approval=wait_approval)
+    return True
 
 
 def do_join(name, wait_approval=True):
     r = rpc("chat-join", [name])
     if not r.get("ok"):
         die(r.get("error", "join failed"))
-    req_id = r["text"]
-    save(PENDING, {"requestID": req_id, "name": name})
+    save(PENDING, {"requestID": r["text"], "name": name, "requestedAt": time.time()})
     if not wait_approval:
-        print(f"join requested ({req_id}) — approve in the BCT chat dock", file=sys.stderr)
+        print(f"join requested ({r['text']}) — approve in the BCT chat dock", file=sys.stderr)
         return
     print("입장 요청됨 — BCT 채팅 도크에서 승인해 주세요 (5분 내)", file=sys.stderr)
     deadline = time.time() + 300
     while time.time() < deadline:
         time.sleep(2)
-        if claim_pending():
+        claim_pending()
+        if identity():
+            # Success is "we have an identity", NOT "PENDING vanished": the daemon polls
+            # too and may legitimately have claimed the approval out from under us.
             print("입장 승인됨", file=sys.stderr)
             return
-        if not os.path.exists(PENDING):
+        if not load(PENDING):
             die("denied or expired")
     die("승인 대기 시간 초과")
 
 
 def authed(cmd, args, timeout=10):
-    """RPC with identity; auto re-join on identity invalidation (BCT restart/eviction)."""
+    """RPC with identity; one bounded re-join on identity invalidation (BCT restart or
+    an eviction). Goes through ensure_membership, so it can never fire a chat-join while
+    a request is already outstanding (D5)."""
     if not identity():
         claim_pending()
     r = rpc(cmd, args, identity(), timeout=timeout)
-    if not r.get("ok") and r.get("error") == NOT_INVITED:
-        obj = load(IDENTITY)
-        if obj:
-            if not may_request_join():
-                return r                      # cooling down — surface NOT_INVITED as-is
-            print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
-            do_join(obj["name"])              # blocking: a live verb wants an answer
-            r = rpc(cmd, args, identity(), timeout=timeout)
+    if not r.get("ok") and r.get("error") == NOT_INVITED and load_identity():
+        if not may_request_join():
+            return r                          # suspended or backing off — surface it as-is
+        print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
+        ensure_membership(wait_approval=True)
+        if not identity():
+            return r
+        r = rpc(cmd, args, identity(), timeout=timeout)
     return r
+
+
+def do_leave():
+    """Leaving must STAY left. The old leave dropped the identity and walked away, so the
+    daemon re-requested membership four minutes later. Suspending the budget is what makes
+    the daemon stand down (and ensure_daemon() refuse to respawn it) — while the session
+    markers survive, because they describe which claude sessions are alive, and that is
+    still true after leaving the room."""
+    r = rpc("chat-leave", [], identity())
+    forget(IDENTITY)
+    forget(PENDING)
+    st = join_state()
+    st["suspended"] = True
+    st["lastOutcome"] = "left"
+    save(JOIN_STATE, st)
+    if not r.get("ok") and r.get("error") != NOT_INVITED:
+        die(r.get("error", "error"))
 
 
 # ---- presence ----------------------------------------------------------
@@ -667,14 +719,20 @@ def do_heartbeat(interval, max_uptime):
                 else:
                     r = rpc("chat-list", [], identity())    # read-only: its only job is touch()
                     if not r.get("ok") and r.get("error") == NOT_INVITED:
-                        # Poll an existing pending request first — never fire a fresh
-                        # chat-join while one is outstanding, or the new requestID
-                        # orphans any approval already in flight for the old one.
-                        if load(PENDING):
+                        # This tick already IS the fresh wire evidence ensure_membership()'s
+                        # identity()-truthy fast path would otherwise trust blindly (a dead
+                        # id kept on disk for its name) — so drive the same pending-first,
+                        # budget-gated sequence directly instead of going through it. Poll an
+                        # outstanding request first — never fire a fresh chat-join while one
+                        # is outstanding, or the new requestID orphans any approval already
+                        # in flight for the old one (D5). The budget itself is what makes a
+                        # `leave` stick (D8) and a denied host stop nagging (D9): once
+                        # suspended, may_request_join() is False and this tick does nothing.
+                        if pending():
                             claim_pending()
-                        else:
-                            obj = load(IDENTITY)
-                            request_join_if_allowed(obj["name"] if obj else default_name())
+                        elif may_request_join():
+                            obj = load_identity()
+                            do_join(obj["name"] if obj else default_name(), wait_approval=False)
                         fails = 0
                     elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
                         fails += 1
@@ -682,8 +740,8 @@ def do_heartbeat(interval, max_uptime):
                         fails = 0
                         claim_pending()  # an approval may have landed since the last tick
             except (Exception, SystemExit):
-                # e.g. request_join_if_allowed -> do_join -> die() on a chat-join error.
-                # A failed tick, nothing more — never let it kill the daemon outright.
+                # e.g. do_join -> die() on a chat-join error. A failed tick, nothing more —
+                # never let it kill the daemon outright.
                 fails += 1
             if fails >= 2:
                 break               # tunnel is down; the next session start respawns us
@@ -723,9 +781,12 @@ def hook_session_id():
 
 
 def session_start():
-    """SessionStart hook: silent no-ops by design, but never silently absent — if the
-    room no longer knows us, raise a fresh join request (cooldown permitting), and keep
-    a heartbeat running for as long as this host has a live claude session.
+    """SessionStart hook: silent no-ops by design, but never silently absent — if we
+    have no seat yet (or one is already outstanding), press it forward through the join
+    budget, and keep a heartbeat running for as long as this host has a live claude
+    session. Detecting a *stale* identity (BCT restarted and forgot us while
+    identity.json still holds the old id) is the daemon's job, not this hook's — it
+    already probes on every tick and reacts on NOT_INVITED.
 
     Invariant: this verb must always exit 0. hooks.json falls back from python3 to
     python on ANY nonzero exit (Windows lacks a reliable "is python3 the MS Store
@@ -750,19 +811,8 @@ def session_start():
             return                  # no ssh session forwarding the socket
         if sid:
             mark_session(sid)       # before spawning: the daemon exits on an empty set
-        # A genuine session (re)start is fresh intent: if the standing cooldown was armed
-        # by a mere EXPIRY (an ignored request, or one lost to a BCT restart during churn),
-        # drop it so the restart re-requests instead of silently sitting out its 30 min. An
-        # explicit DENIAL is respected — never cleared here, so a restart cannot re-nag.
-        _cd = load(COOLDOWN)
-        if _cd and _cd.get("outcome") == "expired":
-            clear_cooldown()
         try:
-            if load(PENDING):
-                claim_pending()
-            elif not (identity() and membership_live()):
-                obj = load(IDENTITY)
-                request_join_if_allowed(obj["name"] if obj else default_name())
+            ensure_membership()     # no-op if seated; polls PENDING; else requests within budget
         except (Exception, SystemExit):
             pass                    # join failed — still spawn the heartbeat below
         if sid:
@@ -895,7 +945,7 @@ def main(argv):
         die("usage: bct-chat.py <join|send|read|wait|listen|list|leave|session-start|session-end|stop-hook|prompt-submit> …")
     verb, rest = argv[0], argv[1:]
     if verb == "join":
-        clear_cooldown()                      # manual intent overrides the cooldown
+        clear_join_state()                    # manual intent always wins — clears a suspension too
         do_join(" ".join(rest) or default_name())
     elif verb == "session-start":
         session_start()
@@ -950,11 +1000,7 @@ def main(argv):
             die(r.get("error", "error"))
         print(r.get("text", ""))
     elif verb == "leave":
-        r = rpc("chat-leave", [], identity())
-        for p in (IDENTITY, PENDING):
-            forget(p)
-        if not r.get("ok") and r.get("error") != NOT_INVITED:
-            die(r.get("error", "error"))
+        do_leave()
     elif verb == "heartbeat":
         interval, max_uptime = HEARTBEAT_INTERVAL, HEARTBEAT_MAX_UPTIME
         if "--interval" in rest:

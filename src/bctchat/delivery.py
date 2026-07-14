@@ -27,9 +27,12 @@ def hook_session_id():
 
 
 def session_start():
-    """SessionStart hook: silent no-ops by design, but never silently absent — if the
-    room no longer knows us, raise a fresh join request (cooldown permitting), and keep
-    a heartbeat running for as long as this host has a live claude session.
+    """SessionStart hook: silent no-ops by design, but never silently absent — if we
+    have no seat yet (or one is already outstanding), press it forward through the join
+    budget, and keep a heartbeat running for as long as this host has a live claude
+    session. Detecting a *stale* identity (BCT restarted and forgot us while
+    identity.json still holds the old id) is the daemon's job, not this hook's — it
+    already probes on every tick and reacts on NOT_INVITED.
 
     Invariant: this verb must always exit 0. hooks.json falls back from python3 to
     python on ANY nonzero exit (Windows lacks a reliable "is python3 the MS Store
@@ -54,19 +57,8 @@ def session_start():
             return                  # no ssh session forwarding the socket
         if sid:
             mark_session(sid)       # before spawning: the daemon exits on an empty set
-        # A genuine session (re)start is fresh intent: if the standing cooldown was armed
-        # by a mere EXPIRY (an ignored request, or one lost to a BCT restart during churn),
-        # drop it so the restart re-requests instead of silently sitting out its 30 min. An
-        # explicit DENIAL is respected — never cleared here, so a restart cannot re-nag.
-        _cd = load(COOLDOWN)
-        if _cd and _cd.get("outcome") == "expired":
-            clear_cooldown()
         try:
-            if load(PENDING):
-                claim_pending()
-            elif not (identity() and membership_live()):
-                obj = load(IDENTITY)
-                request_join_if_allowed(obj["name"] if obj else default_name())
+            ensure_membership()     # no-op if seated; polls PENDING; else requests within budget
         except (Exception, SystemExit):
             pass                    # join failed — still spawn the heartbeat below
         if sid:

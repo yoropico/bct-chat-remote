@@ -22,8 +22,11 @@ if hasattr(sys.stdout, "reconfigure"):
 STATE_DIR = os.environ.get("BCT_CHAT_HOME") or os.path.expanduser("~/.bct-chat")
 IDENTITY = os.path.join(STATE_DIR, "identity.json")
 PENDING = os.path.join(STATE_DIR, "pending-join.json")
-COOLDOWN = os.path.join(STATE_DIR, "join-cooldown.json")
-JOIN_COOLDOWN = 1800            # 30 min — a request the user denied or ignored must not nag
+JOIN_STATE = os.path.join(STATE_DIR, "join-state.json")
+JOIN_BACKOFF = (60, 300, 1800)  # seconds: 1 min, 5 min, 30 min — then suspended for good
+JOIN_MAX_ATTEMPTS = 3           # denied/expired outcomes before the budget suspends itself
+PENDING_TTL = 600               # 10 min — an unrecognized poll reply (BCT forgot the request
+                                 # id) must still retire pending-join.json, not wedge it forever
 SOCK = os.environ.get("BCT_CHAT_SOCK", os.path.expanduser("~/.bct-chat.sock"))
 NO_NEW = "(새 메시지 없음)"
 NO_MENTION = "(새 멘션 없음)"          # chat-listen timeout sentinel (server push)

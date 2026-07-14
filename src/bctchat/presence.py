@@ -72,14 +72,20 @@ def do_heartbeat(interval, max_uptime):
                 else:
                     r = rpc("chat-list", [], identity())    # read-only: its only job is touch()
                     if not r.get("ok") and r.get("error") == NOT_INVITED:
-                        # Poll an existing pending request first — never fire a fresh
-                        # chat-join while one is outstanding, or the new requestID
-                        # orphans any approval already in flight for the old one.
-                        if load(PENDING):
+                        # This tick already IS the fresh wire evidence ensure_membership()'s
+                        # identity()-truthy fast path would otherwise trust blindly (a dead
+                        # id kept on disk for its name) — so drive the same pending-first,
+                        # budget-gated sequence directly instead of going through it. Poll an
+                        # outstanding request first — never fire a fresh chat-join while one
+                        # is outstanding, or the new requestID orphans any approval already
+                        # in flight for the old one (D5). The budget itself is what makes a
+                        # `leave` stick (D8) and a denied host stop nagging (D9): once
+                        # suspended, may_request_join() is False and this tick does nothing.
+                        if pending():
                             claim_pending()
-                        else:
-                            obj = load(IDENTITY)
-                            request_join_if_allowed(obj["name"] if obj else default_name())
+                        elif may_request_join():
+                            obj = load_identity()
+                            do_join(obj["name"] if obj else default_name(), wait_approval=False)
                         fails = 0
                     elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
                         fails += 1
@@ -87,8 +93,8 @@ def do_heartbeat(interval, max_uptime):
                         fails = 0
                         claim_pending()  # an approval may have landed since the last tick
             except (Exception, SystemExit):
-                # e.g. request_join_if_allowed -> do_join -> die() on a chat-join error.
-                # A failed tick, nothing more — never let it kill the daemon outright.
+                # e.g. do_join -> die() on a chat-join error. A failed tick, nothing more —
+                # never let it kill the daemon outright.
                 fails += 1
             if fails >= 2:
                 break               # tunnel is down; the next session start respawns us

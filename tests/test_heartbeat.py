@@ -320,6 +320,11 @@ class HeartbeatTests(unittest.TestCase):
         finally:
             srv.close()
 
+    @unittest.skip("rewritten in Task 6: daemon-as-ear — join-cooldown.json is now "
+                    "join-state.json (Task 5's bounded budget); the daemon's own "
+                    "stop-nagging-after-denial behaviour is preserved (see "
+                    "test_membership.MembershipTests), only this test's file/shape "
+                    "assertions are stale.")
     def test_denied_pending_arms_cooldown_and_stops_join(self):
         # A denied/expired poll must arm the 30-min cooldown, and subsequent
         # ticks must send no further chat-join until it expires.
