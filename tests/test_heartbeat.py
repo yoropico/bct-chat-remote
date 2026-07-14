@@ -20,28 +20,30 @@ NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 
 
 def load_fresh_module(home):
-    """A standalone bct-chat module instance whose STATE_DIR/PIDFILE/etc (computed
-    at import time from ~) resolve under `home`. Lets a test drive do_heartbeat(),
-    heartbeat_alive(), spawn_heartbeat() directly in-process — deterministic, no
-    subprocess/timing — and monkeypatch its I/O-boundary functions (sock_available,
-    rpc, subprocess) without touching the real shared modules other tests use."""
-    old_home = os.environ.get("HOME")
+    """A standalone bct-chat module instance whose STATE_DIR/PIDFILE/etc (computed at
+    import time) resolve under `home`. BCT_CHAT_HOME — not HOME — is the isolation
+    knob: on Windows, expanduser("~") ignores HOME and would hand back the developer's
+    real profile."""
+    old = {k: os.environ.get(k) for k in ("HOME", "BCT_CHAT_HOME")}
     os.environ["HOME"] = home
+    os.environ["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     try:
         spec = importlib.util.spec_from_file_location(f"bct_chat_{id(home)}", CLIENT)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
     finally:
-        if old_home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = old_home
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def start_daemon(home, sock_spec, interval="0.2", max_uptime="30"):
     env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
     env["HOME"] = home
+    env["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     env["BCT_CHAT_SOCK"] = sock_spec
     return subprocess.Popen([sys.executable, CLIENT, "heartbeat",
                              "--interval", interval, "--max-uptime", max_uptime],
@@ -319,8 +321,11 @@ class HeartbeatTests(unittest.TestCase):
             srv.close()
 
     def test_denied_pending_arms_cooldown_and_stops_join(self):
-        # A denied/expired poll must arm the 30-min cooldown, and subsequent
-        # ticks must send no further chat-join until it expires.
+        # A denied poll must arm the join budget's backoff, and subsequent ticks
+        # must send no further chat-join until it expires. This is the daemon's
+        # only coverage of the budget-gate branch (Task 5): it drives the real
+        # daemon process through ensure_membership(force=True), not the
+        # in-process ensure_membership() calls test_membership.py exercises.
         def handler(req):
             if req["cmd"] == "chat-join":
                 return {"ok": True, "text": "REQ-3"}
@@ -329,13 +334,17 @@ class HeartbeatTests(unittest.TestCase):
             return {"ok": False, "error": NOT_INVITED}
 
         srv = FakeChatServer(handler)
-        cooldown = os.path.join(self.state, "join-cooldown.json")
+        join_state = os.path.join(self.state, "join-state.json")
         try:
             self.proc = start_daemon(self.home, f"tcp:127.0.0.1:{srv.port}")
-            self.assertTrue(wait_for(lambda: os.path.exists(cooldown)))
-            with open(cooldown, encoding="utf-8") as f:
-                self.assertEqual(json.load(f)["outcome"], "denied")
-            time.sleep(0.6)     # a few more ticks; cooldown must hold
+            self.assertTrue(wait_for(lambda: os.path.exists(join_state)))
+            with open(join_state, encoding="utf-8") as f:
+                st = json.load(f)
+            self.assertEqual(st["attempts"], 1)
+            self.assertEqual(st["lastOutcome"], "denied")
+            self.assertGreater(st["nextAttemptAt"], time.time())
+            self.assertFalse(st["suspended"])
+            time.sleep(0.6)     # a few more ticks; the backoff must hold
             self.assertEqual(sum(1 for r in srv.received if r["cmd"] == "chat-join"), 1)
         finally:
             srv.close()
@@ -344,6 +353,7 @@ class HeartbeatTests(unittest.TestCase):
         # Matches wait --timeout's validation: no raw IndexError traceback.
         env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
         env["HOME"] = self.home
+        env["BCT_CHAT_HOME"] = os.path.join(self.home, ".bct-chat")
         env["BCT_CHAT_SOCK"] = f"tcp:127.0.0.1:{free_port()}"
         r = subprocess.run([sys.executable, CLIENT, "heartbeat", "--interval"],
                             env=env, capture_output=True, text=True, timeout=10)

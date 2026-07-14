@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+
+# ---- config ------------------------------------------------------------
 """bct-chat.py — external participant client for BCT's group chat.
 
 Speaks the line-JSON wire ({"paneID","cmd","args"} -> {"ok","text","error"})
@@ -10,16 +13,24 @@ Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
 import json, os, re, socket, subprocess, sys, time
 
+ARTIFACT = os.path.abspath(__file__)   # the concatenated single file; what spawn_heartbeat re-execs
+
 if hasattr(sys.stdout, "reconfigure"):
     # Wire and room text are UTF-8; never trust the locale (Korean Windows = cp949).
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-STATE_DIR = os.path.expanduser("~/.bct-chat")
+# BCT_CHAT_HOME overrides the state dir. This is what makes the test suite safe on
+# Windows: ntpath.expanduser() ignores HOME and reads USERPROFILE, so an HOME-isolated
+# test would run against the developer's REAL ~/.bct-chat and SIGKILL their live daemon.
+STATE_DIR = os.environ.get("BCT_CHAT_HOME") or os.path.expanduser("~/.bct-chat")
 IDENTITY = os.path.join(STATE_DIR, "identity.json")
 PENDING = os.path.join(STATE_DIR, "pending-join.json")
-COOLDOWN = os.path.join(STATE_DIR, "join-cooldown.json")
-JOIN_COOLDOWN = 1800            # 30 min — a request the user denied or ignored must not nag
+JOIN_STATE = os.path.join(STATE_DIR, "join-state.json")
+JOIN_BACKOFF = (60, 300, 1800)  # seconds: 1 min, 5 min, 30 min — then suspended for good
+JOIN_MAX_ATTEMPTS = 3           # denied/expired outcomes before the budget suspends itself
+PENDING_TTL = 600               # 10 min — an unrecognized poll reply (BCT forgot the request
+                                 # id) must still retire pending-join.json, not wedge it forever
 SOCK = os.environ.get("BCT_CHAT_SOCK", os.path.expanduser("~/.bct-chat.sock"))
 NO_NEW = "(새 메시지 없음)"
 NO_MENTION = "(새 멘션 없음)"          # chat-listen timeout sentinel (server push)
@@ -29,30 +40,48 @@ PIDFILE = os.path.join(STATE_DIR, "heartbeat.pid")
 HEARTBEAT_INTERVAL = 240        # 4 min — comfortably inside BCT's 10-min prune window
 HEARTBEAT_MAX_UPTIME = 43200    # 12 h — backstop for a marker leaked by a crashed session
 
+STABLE = os.path.join(STATE_DIR, "bct-chat.py")
+
+INBOX_DIR = os.path.join(STATE_DIR, "inbox")
+PROCESSING_DIR = os.path.join(STATE_DIR, "processing")
+DROPPED = os.path.join(STATE_DIR, "dropped.json")
+INBOX_CAP = 50              # a deeper queue means nobody has been home for a long time
+ORPHAN_AGE = 120            # a processing/ item older than this belonged to a dead hook
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
+              '(명단: `python3 ~/.bct-chat/bct-chat.py list`, 새 메시지 확인: '
+              '`python3 ~/.bct-chat/bct-chat.py read`)')
+
+
+# ---- wire --------------------------------------------------------------
+"""Wire transport: unix socket (or TCP fallback) connection to the BCT bridge."""
+import json, os, re, socket, subprocess, sys, time
+
 
 def tcp_target(spec):
-    """$BCT_CHAT_SOCK=tcp:<host>:<port> -> (host, port); None means unix path."""
+    """$BCT_CHAT_SOCK=tcp:<host>:<port> -> (host, port); None means a unix path.
+    IPv6 goes in brackets: tcp:[::1]:9000."""
     if not spec.startswith("tcp:"):
         return None
-    host, _, port = spec[4:].rpartition(":")
+    rest = spec[4:]
+    if rest.startswith("["):
+        host, sep, port = rest[1:].partition("]:")
+        if not sep:
+            return None
+    else:
+        host, _, port = rest.rpartition(":")
     if not port.isdigit():
         return None
-    return (host or "127.0.0.1", int(port))
+    port = int(port)
+    if not 1 <= port <= 65535:
+        return None
+    return (host or "127.0.0.1", port)
 
 
 def default_name():
     return socket.gethostname()
-
-
-def sock_available():
-    t = tcp_target(SOCK)
-    if t is None:
-        return os.path.exists(SOCK)
-    try:
-        socket.create_connection(t, timeout=3).close()
-        return True
-    except OSError:
-        return False
 
 
 def connect(timeout=10):
@@ -61,29 +90,81 @@ def connect(timeout=10):
         return socket.create_connection(t, timeout=timeout)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
-    s.connect(SOCK)
+    try:
+        s.connect(SOCK)
+    except OSError:
+        s.close()
+        raise
     return s
 
 
+def sock_available():
+    """CONNECT — never os.path.exists(). A stale socket file left by an ssh reconnect
+    without StreamLocalBindUnlink still exists on disk; connecting to it is the only
+    way to learn that nobody is home (D4)."""
+    try:
+        connect(timeout=3).close()
+        return True
+    except OSError:
+        return False
+
+
 def rpc(cmd, args, pane_id="", timeout=10):
+    """One request, one line-JSON reply, bounded by an OVERALL deadline — not a
+    per-recv timeout, which a bridge dribbling bytes could keep resetting forever.
+    The deadline covers connect, the request write, and every read: connect gets
+    whatever of the budget remains (capped at 10s), and the socket is re-armed
+    with the remaining budget immediately before sendall so a slow accept can't
+    leave a stale, oversized timeout in force for the write. Blank lines are
+    keepalives and are skipped; if two frames arrive in one read we answer from
+    the first; a bridge that accepts and closes without replying is a socket
+    error, not a malformed response."""
     if tcp_target(SOCK) is None and not os.path.exists(SOCK):
         return {"ok": False, "error": f"socket not found: {SOCK} (ssh RemoteForward up?)"}
+    deadline = time.time() + timeout
     try:
-        s = connect(timeout)
-        s.sendall((json.dumps({"paneID": pane_id, "cmd": cmd, "args": args}) + "\n").encode())
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-        s.close()
-        try:
-            return json.loads(buf.decode())
-        except ValueError:
-            return {"ok": False, "error": "malformed response from bridge"}
+        s = connect(min(max(deadline - time.time(), 0), 10))
     except OSError as e:
         return {"ok": False, "error": f"socket error: {e}"}
+    try:
+        left = deadline - time.time()
+        if left <= 0:
+            return {"ok": False, "error": "socket error: timed out waiting for the bridge"}
+        s.settimeout(left)
+        s.sendall((json.dumps({"paneID": pane_id, "cmd": cmd, "args": args}) + "\n").encode())
+        buf = b""
+        while True:
+            while b"\n" in buf:
+                line, _, buf = buf.partition(b"\n")
+                if not line.strip():
+                    continue                  # keepalive
+                try:
+                    return json.loads(line.decode("utf-8"))
+                except ValueError:
+                    return {"ok": False, "error": "malformed response from bridge"}
+            left = deadline - time.time()
+            if left <= 0:
+                return {"ok": False, "error": "socket error: timed out waiting for the bridge"}
+            s.settimeout(left)
+            try:
+                chunk = s.recv(65536)
+            except socket.timeout:
+                return {"ok": False, "error": "socket error: timed out waiting for the bridge"}
+            if not chunk:
+                return {"ok": False, "error": "socket error: bridge closed without a reply"}
+            buf += chunk
+    except OSError as e:
+        return {"ok": False, "error": f"socket error: {e}"}
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+# ---- state -------------------------------------------------------------
+"""Local state: identity/pending/cooldown JSON files, the stable copy, session markers."""
+import json, os, re, socket, subprocess, sys, time
 
 
 def load(path):
@@ -94,10 +175,23 @@ def load(path):
         return None
 
 
+def atomic_write(path, text):
+    """temp + os.replace: os.replace is atomic on POSIX and on Windows. A hook killed
+    mid-write can then never leave a 0-byte identity.json or a truncated stable copy
+    (which is the very file the skill tells claude to run)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        forget(tmp)
+        raise
+
+
 def save(path, obj):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f)
+    atomic_write(path, json.dumps(obj, ensure_ascii=False))
 
 
 def forget(path):
@@ -107,44 +201,56 @@ def forget(path):
         pass
 
 
-def cooldown_remaining():
-    """Seconds until an automatic join request is allowed again (0 = now)."""
-    obj = load(COOLDOWN)
-    if not obj:
-        return 0
-    left = JOIN_COOLDOWN - (time.time() - obj.get("lastFailedAt", 0))
-    return int(left) if left > 0 else 0
-
-
-def may_request_join():
-    return cooldown_remaining() == 0
-
-
-def note_join_failure(outcome):
-    save(COOLDOWN, {"lastFailedAt": time.time(), "outcome": outcome})
-
-
-def clear_cooldown():
-    forget(COOLDOWN)
-
-
-def request_join_if_allowed(name):
-    """Automatic (non-blocking) join request, gated by the cooldown. The manual
-    `join` verb bypasses this — a human at the remote's shell always wins."""
-    if not may_request_join():
-        print(f"입장 재요청 쿨다운 중 — {cooldown_remaining() // 60}분 후 재시도", file=sys.stderr)
+def proc_alive(pid):
+    """Is this pid a live process? NEVER os.kill(pid, 0) on Windows — CPython maps
+    os.kill to TerminateProcess there for ANY signal, i.e. probing would kill it."""
+    if not pid or pid <= 0:
         return False
-    do_join(name, wait_approval=False)
-    return True
-
-
-STABLE = os.path.join(STATE_DIR, "bct-chat.py")
+    if os.name == "nt":
+        # AttributeError/ImportError/OSError all mean "could not ask" here — never
+        # fall through to the POSIX branch below, which would reach os.kill.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            SYNCHRONIZE = 0x00100000
+            ERROR_ACCESS_DENIED = 5   # NULL handle + this code: alive, owned by someone else
+            # use_last_error=True so ctypes.get_last_error() below reflects THIS call's
+            # GetLastError(), not a stale/unrelated one — ctypes.windll skips that tracking.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # ctypes defaults restype to a 32-bit c_int; HANDLE is pointer-sized on Win64,
+            # so an untyped call truncates/misreads the return value there.
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            h = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+            if h:
+                kernel32.CloseHandle(h)
+                return True
+            # NULL handle: ACCESS_DENIED means the process exists but is owned by a
+            # different session/user — alive, not gone. Any other error (e.g.
+            # ERROR_INVALID_PARAMETER, 87) means no such process.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        except (AttributeError, ImportError, OSError):
+            return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, owned by someone else
+    except OSError:
+        return False
 
 
 def ensure_stable_copy():
-    """Plugin installs live under a versioned cache path; keep one canonical
-    copy at ~/.bct-chat/bct-chat.py for the skill prose and manual use."""
-    me = os.path.abspath(__file__)
+    """Plugin installs live under a versioned cache path; keep one canonical copy at
+    ~/.bct-chat/bct-chat.py for the skill prose and manual use. Guarded against EVERY
+    exception, not just OSError: a truncated (pre-atomic-write) copy raises
+    UnicodeDecodeError, which would exit the hook nonzero and trigger hooks.json's
+    `|| python` re-run with stdin already drained."""
+    me = ARTIFACT
     if me == os.path.abspath(STABLE):
         return
     try:
@@ -154,47 +260,12 @@ def ensure_stable_copy():
             with open(STABLE, encoding="utf-8") as f:
                 if f.read() == src:
                     return
-        except OSError:
+        except Exception:
             pass
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(STABLE, "w", encoding="utf-8") as f:
-            f.write(src)
+        atomic_write(STABLE, src)
         os.chmod(STABLE, 0o755)
-    except OSError:
+    except Exception:
         pass                        # best-effort; never block session start
-
-
-def identity():
-    obj = load(IDENTITY)
-    return obj.get("participantID", "") if obj else ""
-
-
-def membership_live():
-    """Does BCT still know this identity? A BCT restart resets the room, but
-    identity.json outlives it — so ask the bridge, never trust the file. The dead
-    identity is KEPT (it only ever earns NOT_INVITED, the rejoin needs the name
-    beside it, and the heartbeat needs something to send); a new approval
-    overwrites it. Any other error (bridge hiccup) counts as live: better silent
-    than a spurious join banner."""
-    r = rpc("chat-list", [], identity())      # read-only probe; consumes no messages
-    return r.get("ok") or r.get("error") != NOT_INVITED
-
-
-def claim_pending():
-    """If a session-start hook left a requestID, try to claim the identity."""
-    obj = load(PENDING)
-    if not obj:
-        return False
-    r = rpc("chat-join-poll", [obj["requestID"]])
-    if r.get("ok") and (r.get("text") or "").startswith("approved\n"):
-        save(IDENTITY, {"participantID": r["text"].split("\n", 1)[1], "name": obj["name"]})
-        forget(PENDING)
-        clear_cooldown()                      # seated — the slate is clean
-        return True
-    if not r.get("ok") and r.get("error") in ("denied", "expired"):
-        forget(PENDING)
-        note_join_failure(r["error"])         # arm the 30-min cooldown
-    return False
 
 
 def mark_session(sid):
@@ -212,6 +283,395 @@ def live_sessions():
         return os.listdir(SESSIONS_DIR)
     except OSError:
         return []
+
+
+# ---- inbox -------------------------------------------------------------
+"""The local mention inbox: the durability boundary between the daemon's ear and the
+hooks' mouth. The daemon does not issue its next chat-listen until the item is here,
+so a message whose server-side cursor has advanced is always already on local disk."""
+import json, os, re, socket, subprocess, sys, time
+
+
+def _items(d):
+    try:
+        return sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except OSError:
+        return []
+
+
+def _evict(path):
+    """Claim a cap-eviction candidate by os.rename, not os.remove. Eviction must count
+    only the files it actually removed — that requires eviction and inbox_claim() to
+    compete for the same file through the SAME primitive, so that losing is
+    observable. os.rename raises on the loser; a bare os.remove's failure is exactly
+    what forget() swallows via `except OSError: pass`, which is what let a naive
+    version count an item as dropped even when inbox_claim() had already delivered
+    it. So eviction uses the exact same rename arbitration inbox_claim does, never a
+    bare remove."""
+    trash = f"{path}.{os.getpid()}.evict"
+    try:
+        os.rename(path, trash)
+    except OSError:
+        return False              # inbox_claim already won this file — not a drop
+    forget(trash)
+    return True
+
+
+def take_dropped():
+    """Read-and-clear the count of mentions the cap threw away, for the next digest.
+    Claimed by os.rename, same as an inbox item: two hooks racing here are mutually
+    exclusive, not a split — the winner takes the whole count and the loser gets 0
+    (never a double-report), and a concurrent inbox_put() bumping the counter must
+    never have its update lost underneath a bare load+delete."""
+    claim = f"{DROPPED}.{os.getpid()}.claim"
+    try:
+        os.rename(DROPPED, claim)
+    except OSError:
+        return 0
+    obj = load(claim) or {}
+    forget(claim)
+    return int(obj.get("n", 0))
+
+
+def _bump_dropped(n):
+    """The daemon is the only writer (one daemon per host, ticking sequentially), but
+    take_dropped() readers race it. A plain load-then-save here would let a reader's
+    steal land between the read and the write and silently swallow this bump — so
+    the read side is a steal too (os.rename, same arbitration as take_dropped): if a
+    reader wins it, this call starts a fresh counter instead of resurrecting a value
+    that has already been handed out. The new total is saved BEFORE the sidecar is
+    forgotten, not after: a crash in between then leaves a harmless orphan sidecar
+    (swept by recover_orphans()) rather than losing the accumulated count."""
+    claim = f"{DROPPED}.{os.getpid()}.bump"
+    stolen = False
+    try:
+        os.rename(DROPPED, claim)
+        stolen = True
+        obj = load(claim) or {}
+    except OSError:
+        obj = {}
+    save(DROPPED, {"n": int(obj.get("n", 0)) + n})
+    if stolen:
+        forget(claim)
+
+
+def inbox_put(text, name):
+    """One mention -> one file. Atomic: a reader can never see a half-written item."""
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    names = _items(INBOX_DIR)
+    excess = len(names) - (INBOX_CAP - 1)
+    if excess > 0:
+        dropped = sum(1 for n in names[:excess]
+                      if _evict(os.path.join(INBOX_DIR, n)))
+        if dropped:
+            _bump_dropped(dropped)
+    path = os.path.join(INBOX_DIR, f"{time.time_ns()}-{os.getpid()}.json")
+    atomic_write(path, json.dumps({"text": text, "capturedAt": time.time(), "name": name},
+                                  ensure_ascii=False))
+    return path
+
+
+def inbox_claim():
+    """Take the oldest item, atomically. os.rename is the whole concurrency design:
+    two hooks racing, the loser's rename raises and it moves on to the next item —
+    exactly one session ever delivers a given mention, with no lock to leak."""
+    os.makedirs(PROCESSING_DIR, exist_ok=True)
+    for n in _items(INBOX_DIR):
+        src = os.path.join(INBOX_DIR, n)
+        dst = os.path.join(PROCESSING_DIR, f"{os.getpid()}-{n}")
+        try:
+            os.rename(src, dst)
+        except OSError:
+            continue                    # another hook won it
+        item = load(dst)
+        if not isinstance(item, dict) or "text" not in item:
+            # Corrupt: drop it, never hand it to claude — but do NOT _bump_dropped()
+            # it. inbox_claim() runs from the hooks, the one place N processes really
+            # do run concurrently, and _bump_dropped()'s load-modify-save is only
+            # safe because the daemon is its single writer; counting from here would
+            # reopen the lost-update race that invariant exists to prevent. atomic_write
+            # means an item is never half-written, so a corrupt item needs disk damage
+            # or outside tampering — not worth trading that invariant for.
+            forget(dst)
+            continue
+        return (dst, item)
+    return None
+
+
+def inbox_ack(path):
+    forget(path)
+
+
+_SIDECAR_RE = re.compile(r"\.(\d+)\.(?:evict|claim|bump|tmp)$")
+
+
+def _sweep_sidecars(d, now):
+    """.evict/.claim/.bump/.tmp sidecars are left behind by a process that dies mid
+    rename-steal or mid atomic_write; on a long-lived host they'd otherwise
+    accumulate forever, so anything abandoned by a dead owner is swept.
+
+    Every sidecar name carries the pid of the process that created it —
+    `<path>.<pid>.<kind>`, the shape _evict()/take_dropped()/_bump_dropped()'s
+    .evict/.claim/.bump and atomic_write's .tmp all share. Correctness rests on
+    that pid, not on mtime: a .claim/.bump sidecar is born via
+    os.rename(DROPPED, claim), not a write, so it inherits dropped.json's OLD mtime
+    rather than getting a fresh one — it can read as already-older-than-ORPHAN_AGE
+    the instant it's created, if dropped.json itself sat unwritten for a while
+    before the steal. A mtime-only test could then delete a sidecar a live steal is
+    still holding, and there is no way to close that window with timing (e.g.
+    refreshing the mtime right after the rename) because the rename and the refresh
+    can never be made atomic with each other — a sweep can always land in the gap
+    between them. So this function never removes a sidecar whose owner
+    (proc_alive()) is still alive, regardless of its mtime; that is what actually
+    closes the race, not a staleness threshold.
+
+    Once the owner is confirmed dead, ORPHAN_AGE is still checked as a second,
+    independent condition, so a pid number that has since been recycled by an
+    unrelated new process can't make an otherwise-fresh sidecar look sweepable the
+    moment its original owner is gone.
+
+    .evict sidecars need no further guard beyond the pid check: _evict() never
+    reads one back, so a sweep that beats its forget() just makes that forget() a
+    no-op — the True return still correctly means "we really removed it". .tmp
+    files are born from a real write, so their mtime is genuine from the start; the
+    pid guard still keeps a sweep from landing mid-write."""
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for name in names:
+        m = _SIDECAR_RE.search(name)
+        if not m:
+            continue
+        if proc_alive(int(m.group(1))):
+            continue                   # owner is still working it — never sweep
+        p = os.path.join(d, name)
+        try:
+            if now - os.stat(p).st_mtime >= ORPHAN_AGE:
+                forget(p)
+        except OSError:
+            pass
+
+
+def recover_orphans():
+    """A hook that died between claim and print left its item in processing/. Return it
+    to the inbox: at-least-once delivery (a rare duplicate) beats a silent loss, and it
+    is what makes hooks.json's `|| python` re-run harmless. Also sweeps stale sidecar
+    files (see _sweep_sidecars) — this is the one function that already runs
+    periodically, so it doubles as the janitor."""
+    os.makedirs(INBOX_DIR, exist_ok=True)   # else every rename below fails ENOENT
+    n = 0
+    now = time.time()
+    for name in _items(PROCESSING_DIR):
+        p = os.path.join(PROCESSING_DIR, name)
+        try:
+            if now - os.stat(p).st_mtime < ORPHAN_AGE:
+                continue
+            os.rename(p, os.path.join(INBOX_DIR, name.split("-", 1)[1]))
+            n += 1
+        except OSError:
+            pass
+    _sweep_sidecars(INBOX_DIR, now)
+    _sweep_sidecars(PROCESSING_DIR, now)
+    _sweep_sidecars(os.path.dirname(DROPPED), now)
+    return n
+
+
+def inbox_wait(seconds, poll=1.0):
+    """Standby's hold: a local poll on a directory. Zero RPC, zero tokens."""
+    deadline = time.time() + seconds
+    while True:
+        got = inbox_claim()
+        if got:
+            return got
+        if time.time() >= deadline:
+            return None
+        time.sleep(min(poll, max(0.0, deadline - time.time())))
+
+
+# ---- membership --------------------------------------------------------
+"""Membership: identity, the outstanding request, and the budget that decides whether
+we may ask again. ONE automatic-join entry point (ensure_membership) — the old code had
+three callers racing each other, and a second chat-join while one is outstanding orphans
+the approval the user is in the middle of granting."""
+import json, os, re, socket, subprocess, sys, time
+
+
+def load_identity():
+    return load(IDENTITY)
+
+
+def identity():
+    obj = load_identity()
+    return obj.get("participantID", "") if obj else ""
+
+
+def join_state():
+    zero = {"attempts": 0, "nextAttemptAt": 0, "suspended": False, "lastOutcome": ""}
+    obj = load(JOIN_STATE)
+    if not isinstance(obj, dict):
+        return zero
+    try:
+        return {"attempts": int(obj.get("attempts", 0)),
+                "nextAttemptAt": float(obj.get("nextAttemptAt", 0)),
+                "suspended": bool(obj.get("suspended", False)),
+                "lastOutcome": str(obj.get("lastOutcome", ""))}
+    except (TypeError, ValueError):
+        # Called from the daemon's tick via may_request_join(); an exception here
+        # costs a failed tick, so a malformed field (e.g. {"attempts": "x"}) must
+        # read as no-budget-recorded-yet, not blow up the caller.
+        return zero
+
+
+def clear_join_state():
+    forget(JOIN_STATE)
+
+
+def suspended():
+    return join_state()["suspended"]
+
+
+def may_request_join():
+    st = join_state()
+    return not st["suspended"] and time.time() >= st["nextAttemptAt"]
+
+
+def note_join_outcome(outcome):
+    """A refusal is information, not a reason to keep asking. Back off, then stop:
+    three denied/expired outcomes and we never ask again on our own — only a human
+    running `bct-chat.py join` at the remote's shell resumes it."""
+    st = join_state()
+    st["attempts"] += 1
+    st["lastOutcome"] = outcome
+    idx = min(st["attempts"], len(JOIN_BACKOFF)) - 1
+    st["nextAttemptAt"] = time.time() + JOIN_BACKOFF[idx]
+    st["suspended"] = st["attempts"] >= JOIN_MAX_ATTEMPTS
+    save(JOIN_STATE, st)
+
+
+def pending():
+    """The outstanding request, or None. A TTL — not the poll's reply — is what
+    ultimately retires it: an unrecognized error (BCT restarted and forgot the id)
+    used to wedge the file forever, and every auto-join caller prefers PENDING over
+    requesting, so the rejoin branch became unreachable (D6).
+
+    A pending-join.json written before this budget existed has no requestedAt.
+    Reading that absence as `0` would make the request read ~55 years old and
+    get discarded on sight — on the upgrade tick that throws away a legitimately
+    outstanding request and fires a fresh chat-join, orphaning an approval the
+    user may be looking at right now (the exact defect this budget exists to
+    kill). Backfill instead: treat a missing requestedAt as "just requested"."""
+    obj = load(PENDING)
+    if not isinstance(obj, dict) or "requestID" not in obj:
+        return None
+    if "requestedAt" not in obj:
+        obj["requestedAt"] = time.time()
+        save(PENDING, obj)
+        return obj
+    if time.time() - float(obj.get("requestedAt", 0)) > PENDING_TTL:
+        forget(PENDING)
+        return None
+    return obj
+
+
+def claim_pending():
+    obj = pending()
+    if not obj:
+        return False
+    r = rpc("chat-join-poll", [obj["requestID"]])
+    if r.get("ok") and (r.get("text") or "").startswith("approved\n"):
+        save(IDENTITY, {"participantID": r["text"].split("\n", 1)[1], "name": obj["name"]})
+        forget(PENDING)
+        clear_join_state()                    # seated — the slate is clean
+        return True
+    if not r.get("ok") and r.get("error") in ("denied", "expired"):
+        forget(PENDING)
+        note_join_outcome(r["error"])
+    return False
+
+
+def ensure_membership(wait_approval=False, force=False):
+    """The ONLY automatic path into the room. Returns True if we are seated or a request
+    is now outstanding.
+
+    `force=True` skips the identity()-truthy fast path below. It exists for a caller
+    that already has fresh wire evidence the stored identity is dead — not merely
+    absent — and must not let a truthy-but-stale identity.json short-circuit a rejoin
+    (the presence daemon's NOT_INVITED tick is the only such caller)."""
+    if identity() and not wait_approval and not force:
+        return True
+    if pending():
+        return claim_pending() or True        # a request is in flight: poll it, never re-ask
+    if not may_request_join():
+        return False
+    obj = load_identity()
+    do_join(obj["name"] if obj else default_name(), wait_approval=wait_approval)
+    return True
+
+
+def do_join(name, wait_approval=True):
+    r = rpc("chat-join", [name])
+    if not r.get("ok"):
+        die(r.get("error", "join failed"))
+    save(PENDING, {"requestID": r["text"], "name": name, "requestedAt": time.time()})
+    if not wait_approval:
+        print(f"join requested ({r['text']}) — approve in the BCT chat dock", file=sys.stderr)
+        return
+    print("입장 요청됨 — BCT 채팅 도크에서 승인해 주세요 (5분 내)", file=sys.stderr)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(2)
+        claim_pending()
+        if identity():
+            # Success is "we have an identity", NOT "PENDING vanished": the daemon polls
+            # too and may legitimately have claimed the approval out from under us.
+            print("입장 승인됨", file=sys.stderr)
+            return
+        if not load(PENDING):
+            die("denied or expired")
+    die("승인 대기 시간 초과")
+
+
+def authed(cmd, args, timeout=10):
+    """RPC with identity; one bounded re-join on identity invalidation (BCT restart or
+    an eviction). Goes through ensure_membership, so it can never fire a chat-join while
+    a request is already outstanding (D5)."""
+    if not identity():
+        claim_pending()
+    r = rpc(cmd, args, identity(), timeout=timeout)
+    if not r.get("ok") and r.get("error") == NOT_INVITED and load_identity():
+        if not may_request_join():
+            return r                          # suspended or backing off — surface it as-is
+        print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
+        ensure_membership(wait_approval=True)
+        if not identity():
+            return r
+        r = rpc(cmd, args, identity(), timeout=timeout)
+    return r
+
+
+def do_leave():
+    """Leaving must STAY left. The old leave dropped the identity and walked away, so the
+    daemon re-requested membership four minutes later. Suspending the budget is what makes
+    it stick: session_start() will happily respawn the heartbeat daemon after a leave
+    (spawn_heartbeat() has no suspension check, and there is no ensure_daemon() gate yet —
+    that's Task 6), but the respawned daemon finds may_request_join() False and never
+    re-requests — while the session markers survive, because they describe which claude
+    sessions are alive, and that is still true after leaving the room."""
+    r = rpc("chat-leave", [], identity())
+    forget(IDENTITY)
+    forget(PENDING)
+    st = join_state()
+    st["suspended"] = True
+    st["lastOutcome"] = "left"
+    save(JOIN_STATE, st)
+    if not r.get("ok") and r.get("error") != NOT_INVITED:
+        die(r.get("error", "error"))
+
+
+# ---- presence ----------------------------------------------------------
+"""Heartbeat daemon: proves this host is alive while any claude session on it is."""
+import json, os, re, socket, subprocess, sys, time
 
 
 def heartbeat_alive():
@@ -234,7 +694,7 @@ def spawn_heartbeat():
     else:
         kwargs["start_new_session"] = True
     try:
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), "heartbeat"], **kwargs)
+        subprocess.Popen([sys.executable, ARTIFACT, "heartbeat"], **kwargs)
     except OSError:
         pass                        # best-effort; never block session start
 
@@ -263,8 +723,7 @@ def do_heartbeat(interval, max_uptime):
         return                      # another daemon has it
     me = os.getpid()
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(PIDFILE, "w", encoding="utf-8") as f:
-        f.write(str(me))
+    atomic_write(PIDFILE, str(me))
     started = time.time()
     fails = 0
     try:
@@ -285,14 +744,19 @@ def do_heartbeat(interval, max_uptime):
                 else:
                     r = rpc("chat-list", [], identity())    # read-only: its only job is touch()
                     if not r.get("ok") and r.get("error") == NOT_INVITED:
-                        # Poll an existing pending request first — never fire a fresh
-                        # chat-join while one is outstanding, or the new requestID
-                        # orphans any approval already in flight for the old one.
-                        if load(PENDING):
-                            claim_pending()
-                        else:
-                            obj = load(IDENTITY)
-                            request_join_if_allowed(obj["name"] if obj else default_name())
+                        # This tick already IS the fresh wire evidence that a truthy
+                        # identity.json is dead on the wire, not merely absent —
+                        # ensure_membership()'s identity()-truthy fast path would
+                        # otherwise trust the file blindly and never re-join.
+                        # force=True skips that fast path while wait_approval stays
+                        # False, so the same pending-first, budget-gated sequence every
+                        # other automatic caller uses runs here too, without blocking
+                        # the tick loop. That single entry point is what makes a
+                        # `leave` stick (D8) and a denied host stop nagging (D9): once
+                        # suspended, may_request_join() is False and this tick does
+                        # nothing; and what stops a fresh chat-join from orphaning an
+                        # approval already in flight for an outstanding one (D5).
+                        ensure_membership(force=True)
                         fails = 0
                     elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
                         fails += 1
@@ -300,8 +764,8 @@ def do_heartbeat(interval, max_uptime):
                         fails = 0
                         claim_pending()  # an approval may have landed since the last tick
             except (Exception, SystemExit):
-                # e.g. request_join_if_allowed -> do_join -> die() on a chat-join error.
-                # A failed tick, nothing more — never let it kill the daemon outright.
+                # e.g. do_join -> die() on a chat-join error. A failed tick, nothing more —
+                # never let it kill the daemon outright.
                 fails += 1
             if fails >= 2:
                 break               # tunnel is down; the next session start respawns us
@@ -311,28 +775,9 @@ def do_heartbeat(interval, max_uptime):
             forget(PIDFILE)         # only ever release a pid file we still own
 
 
-def do_join(name, wait_approval=True):
-    r = rpc("chat-join", [name])
-    if not r.get("ok"):
-        die(r.get("error", "join failed"))
-    req_id = r["text"]
-    save(PENDING, {"requestID": req_id, "name": name})
-    if not wait_approval:
-        print(f"join requested ({req_id}) — approve in the BCT chat dock", file=sys.stderr)
-        return
-    print("입장 요청됨 — BCT 채팅 도크에서 승인해 주세요 (5분 내)", file=sys.stderr)
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        time.sleep(2)
-        if claim_pending():
-            print("입장 승인됨", file=sys.stderr)
-            return
-        if not os.path.exists(PENDING):
-            die("denied or expired")
-    die("승인 대기 시간 초과")
-
-
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# ---- delivery ----------------------------------------------------------
+"""Hook entry points: SessionStart/SessionEnd/Stop/UserPromptSubmit digest delivery."""
+import json, os, re, socket, subprocess, sys, time
 
 
 def hook_session_id():
@@ -360,9 +805,12 @@ def hook_session_id():
 
 
 def session_start():
-    """SessionStart hook: silent no-ops by design, but never silently absent — if the
-    room no longer knows us, raise a fresh join request (cooldown permitting), and keep
-    a heartbeat running for as long as this host has a live claude session.
+    """SessionStart hook: silent no-ops by design, but never silently absent — if we
+    have no seat yet (or one is already outstanding), press it forward through the join
+    budget, and keep a heartbeat running for as long as this host has a live claude
+    session. Detecting a *stale* identity (BCT restarted and forgot us while
+    identity.json still holds the old id) is the daemon's job, not this hook's — it
+    already probes on every tick and reacts on NOT_INVITED.
 
     Invariant: this verb must always exit 0. hooks.json falls back from python3 to
     python on ANY nonzero exit (Windows lacks a reliable "is python3 the MS Store
@@ -387,19 +835,8 @@ def session_start():
             return                  # no ssh session forwarding the socket
         if sid:
             mark_session(sid)       # before spawning: the daemon exits on an empty set
-        # A genuine session (re)start is fresh intent: if the standing cooldown was armed
-        # by a mere EXPIRY (an ignored request, or one lost to a BCT restart during churn),
-        # drop it so the restart re-requests instead of silently sitting out its 30 min. An
-        # explicit DENIAL is respected — never cleared here, so a restart cannot re-nag.
-        _cd = load(COOLDOWN)
-        if _cd and _cd.get("outcome") == "expired":
-            clear_cooldown()
         try:
-            if load(PENDING):
-                claim_pending()
-            elif not (identity() and membership_live()):
-                obj = load(IDENTITY)
-                request_join_if_allowed(obj["name"] if obj else default_name())
+            ensure_membership()     # no-op if seated; polls PENDING; else requests within budget
         except (Exception, SystemExit):
             pass                    # join failed — still spawn the heartbeat below
         if sid:
@@ -420,27 +857,6 @@ def session_end():
             unmark_session(sid)
     except (Exception, SystemExit):
         pass
-
-
-def authed(cmd, args, timeout=10):
-    """RPC with identity; auto re-join on identity invalidation (BCT restart/eviction)."""
-    if not identity():
-        claim_pending()
-    r = rpc(cmd, args, identity(), timeout=timeout)
-    if not r.get("ok") and r.get("error") == NOT_INVITED:
-        obj = load(IDENTITY)
-        if obj:
-            if not may_request_join():
-                return r                      # cooling down — surface NOT_INVITED as-is
-            print("identity invalid (BCT 재시작/내보내기) — 재입장 요청", file=sys.stderr)
-            do_join(obj["name"])              # blocking: a live verb wants an answer
-            r = rpc(cmd, args, identity(), timeout=timeout)
-    return r
-
-
-REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
-              '(명단: `python3 ~/.bct-chat/bct-chat.py list`, 새 메시지 확인: '
-              '`python3 ~/.bct-chat/bct-chat.py read`)')
 
 
 def compose_digest(name, read_text):
@@ -538,6 +954,11 @@ def prompt_submit_hook():
         pass
 
 
+# ---- cli ---------------------------------------------------------------
+"""Entry point: argv dispatch for the join/send/read/... verbs and hook shims."""
+import json, os, re, socket, subprocess, sys, time
+
+
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
@@ -548,7 +969,7 @@ def main(argv):
         die("usage: bct-chat.py <join|send|read|wait|listen|list|leave|session-start|session-end|stop-hook|prompt-submit> …")
     verb, rest = argv[0], argv[1:]
     if verb == "join":
-        clear_cooldown()                      # manual intent overrides the cooldown
+        clear_join_state()                    # manual intent always wins — clears a suspension too
         do_join(" ".join(rest) or default_name())
     elif verb == "session-start":
         session_start()
@@ -603,11 +1024,7 @@ def main(argv):
             die(r.get("error", "error"))
         print(r.get("text", ""))
     elif verb == "leave":
-        r = rpc("chat-leave", [], identity())
-        for p in (IDENTITY, PENDING):
-            forget(p)
-        if not r.get("ok") and r.get("error") != NOT_INVITED:
-            die(r.get("error", "error"))
+        do_leave()
     elif verb == "heartbeat":
         interval, max_uptime = HEARTBEAT_INTERVAL, HEARTBEAT_MAX_UPTIME
         if "--interval" in rest:
@@ -629,7 +1046,6 @@ def main(argv):
         do_heartbeat(interval, max_uptime)
     else:
         die(f"unknown verb: {verb}")
-
 
 if __name__ == "__main__":
     main(sys.argv[1:])

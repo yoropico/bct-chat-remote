@@ -9,6 +9,7 @@ CLIENT = os.path.join(REPO, "scripts", "bct-chat.py")
 def run_session_start(client_path, home):
     env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
     env["HOME"] = home
+    env["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     return subprocess.run([sys.executable, client_path, "session-start"],
                           env=env, capture_output=True, text=True, timeout=30)
 
@@ -48,7 +49,8 @@ class StableCopyTests(unittest.TestCase):
         # Korean Windows defaults open() to cp949; the client source is UTF-8.
         # PYTHONCOERCECLOCALE=0 + LC_ALL=C pins an ASCII locale to reproduce.
         env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
-        env.update(HOME=self.home, LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0")
+        env.update(HOME=self.home, BCT_CHAT_HOME=os.path.join(self.home, ".bct-chat"),
+                   LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0")
         r = subprocess.run([sys.executable, "-X", "utf8=0", CLIENT, "session-start"],
                            env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -56,7 +58,8 @@ class StableCopyTests(unittest.TestCase):
             self.assertEqual(f.read(), g.read())
 
     def test_bct_pane_guard_skips_copy(self):
-        env = dict(os.environ, HOME=self.home, BCT_PANE_ID="deadbeef")
+        env = dict(os.environ, HOME=self.home,
+                   BCT_CHAT_HOME=os.path.join(self.home, ".bct-chat"), BCT_PANE_ID="deadbeef")
         r = subprocess.run([sys.executable, CLIENT, "session-start"],
                            env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
