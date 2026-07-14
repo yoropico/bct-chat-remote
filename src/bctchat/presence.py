@@ -59,7 +59,11 @@ def gc_markers():
         p = os.path.join(SESSIONS_DIR, sid)
         try:
             pid = int((load(p) or {}).get("pid", 0) or 0)
-        except (AttributeError, TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            # OverflowError is not hypothetical: json parses a literal `Infinity` (and any
+            # 1e400-style overflow) to float inf, and int(inf) raises it. This function runs
+            # OUTSIDE the daemon's per-tick guard, so anything escaping here is a fourth exit
+            # condition — the docstring's "nothing in here may raise" has to be literally true.
             pid = 0
         try:
             age = time.time() - os.stat(p).st_mtime

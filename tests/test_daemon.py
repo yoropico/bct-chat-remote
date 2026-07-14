@@ -312,6 +312,21 @@ class DaemonTests(unittest.TestCase):
                           stop_after=2)
         self.mod.do_daemon(presence_interval=999, listen_timeout=1)   # must not raise
 
+    def test_a_corrupt_state_file_cannot_kill_the_daemon(self):
+        # json parses a literal `Infinity` to float inf, and int(inf) raises OverflowError —
+        # which gc_markers()/join_state()'s except tuples did not name. identity.json holding a
+        # JSON list is truthy and reaches .get() -> AttributeError. All three run OUTSIDE the
+        # daemon's per-tick guard, so each would have been a fourth exit condition.
+        with open(os.path.join(self.mod.SESSIONS_DIR, "inf"), "w") as f:
+            f.write('{"pid": Infinity, "startedAt": 0}')
+        with open(self.mod.JOIN_STATE, "w") as f:
+            f.write('{"attempts": Infinity}')
+        with open(self.mod.IDENTITY, "w") as f:
+            f.write('["not", "a", "dict"]')
+        self.mod.gc_markers()                       # must answer, not raise
+        self.mod.join_state()
+        self.assertEqual(self.mod.identity(), "")   # a corrupt identity reads as absent
+
     def test_gc_removes_a_crashed_sessions_marker(self):
         # A reaped pid, not the constant 999999 — Linux's default pid_max (4194304) makes
         # 999999 an ordinary, possibly-live pid there (macOS caps at 99999).

@@ -10,8 +10,11 @@ def load_identity():
 
 
 def identity():
+    # Shape-check like its sibling loaders (join_state, pending): a truthy non-dict — an
+    # identity.json holding a JSON list — would reach .get() and raise AttributeError, and
+    # the daemon calls this outside its per-tick guard.
     obj = load_identity()
-    return obj.get("participantID", "") if obj else ""
+    return obj.get("participantID", "") if isinstance(obj, dict) else ""
 
 
 def join_state():
@@ -24,7 +27,7 @@ def join_state():
                 "nextAttemptAt": float(obj.get("nextAttemptAt", 0)),
                 "suspended": bool(obj.get("suspended", False)),
                 "lastOutcome": str(obj.get("lastOutcome", ""))}
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # json parses `Infinity`; int(inf) overflows
         # Called from the daemon's tick via may_request_join(); an exception here
         # costs a failed tick, so a malformed field (e.g. {"attempts": "x"}) must
         # read as no-budget-recorded-yet, not blow up the caller.
