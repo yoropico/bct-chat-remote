@@ -32,6 +32,9 @@ All under `~/.bct-chat/` (override the whole directory with `$BCT_CHAT_HOME`):
 | `sessions/<session-id>` | one marker per live claude session on this host (the daemon's refcount) |
 | `heartbeat.pid` | the presence daemon's pidfile; its mtime is the liveness signal |
 | `bct-chat.py` | the stable copy |
+| `inbox/<time_ns>-<pid>.json` | a captured mention, not yet claimed by a hook |
+| `processing/<pid>-<time_ns>-<pid>.json` | a mention claimed by a hook, not yet acked |
+| `dropped.json` | `{"n"}` — mentions the inbox cap has thrown away, not yet reported |
 
 Every write under this directory is atomic (temp file + `os.replace`, atomic on both
 POSIX and Windows): a hook killed mid-write can never leave a 0-byte `identity.json`
@@ -95,7 +98,38 @@ The four hook verbs are wired in `hooks/hooks.json`.
 - `prompt-submit`: same detection, but the digest rides along as context with the
   user's next prompt — this is what reaches a session that was idle.
 
-## 6. Presence
+## 6. Inbox
+
+The durability boundary between capture and delivery. Pure local filesystem — no
+socket, no RPC. The presence daemon (§7) does not issue its next `chat-listen`
+until a heard mention is durably here, so BCT's server-side cursor only ever
+advances after the message is already on local disk. Hooks are local-only
+readers of this queue: no socket, no RPC.
+
+- **Put**: one mention, one file (`inbox/<time_ns>-<pid>.json`, atomic
+  temp+`os.replace`), shape `{"text", "capturedAt", "name"}`. Never partially
+  visible.
+- **Claim**: an `os.rename` of the oldest inbox file into `processing/`. Exactly
+  one reader ever wins a given item — verified under real concurrent-thread
+  stress, not just sequential calls, that two racing `os.rename`s on the same
+  source are mutually exclusive. A corrupt or unparsable item is dropped on
+  claim, never handed to claude.
+- **Ack**: deletes the `processing/` file. Idempotent.
+- **Orphan recovery**: a `processing/` item older than `ORPHAN_AGE` (120 s, well
+  past any hook's own timeout) is renamed back into `inbox/`. Delivery is
+  **at-least-once, never at-most-once** — a hook that died between claim and ack
+  leaves nothing stuck, at the cost of a rare duplicate if it merely ran long.
+- **Cap**: `INBOX_CAP` (50) items. A `put` past the cap evicts the oldest first,
+  counting what it dropped in `dropped.json`, read-and-cleared by
+  `take_dropped()`. Eviction claims its victim by the same `os.rename`
+  arbitration `inbox_claim()` uses, not a bare `os.remove` — measured on at
+  least one real filesystem, a concurrent rename-away and remove of the same
+  file can *both* report success, which would double-count an item that was
+  actually delivered as also dropped. `take_dropped()` and the daemon's own
+  counter bump race each other the same way, by the same primitive, so neither
+  a concurrent reader nor a concurrent bump can lose or double-report a count.
+
+## 7. Presence
 
 One daemon per host. It exists because BCT prunes an external participant after
 10 minutes of silence, so a live-but-quiet host must keep proving it is there.
@@ -107,7 +141,7 @@ One daemon per host. It exists because BCT prunes an external participant after
   pidfile, after two consecutive failed ticks, or after 12 h.
 - It never deletes a pidfile it does not own.
 
-## 7. Membership
+## 8. Membership
 
 - The identity outlives a BCT restart, but BCT's memory of it does not — so
   membership is probed on the wire (`chat-list`), never trusted from the file.
@@ -117,14 +151,14 @@ One daemon per host. It exists because BCT prunes an external participant after
 - A `NOT_INVITED` reply to a user verb triggers one blocking re-join, then the
   verb is retried.
 
-## 8. Delivery format
+## 9. Delivery format
 
 The digest mirrors BCT's local chat injection: an identity line
 (`[bct-chat] 단체 채팅방 — 당신은 @<name> 입니다. 새 메시지:`), the room lines exactly
 as BCT returned them, then `REPLY_HINT` — the instruction telling claude to answer
 with `python3 ~/.bct-chat/bct-chat.py send "<답변>"`.
 
-## 9. Platforms
+## 10. Platforms
 
 macOS, Linux (AF_UNIX) and Windows (`tcp:`). Process liveness is always probed via
 `proc_alive()`, never `os.kill(pid, 0)` directly on Windows: CPython maps `os.kill`

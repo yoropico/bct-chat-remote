@@ -35,6 +35,12 @@ HEARTBEAT_MAX_UPTIME = 43200    # 12 h — backstop for a marker leaked by a cra
 
 STABLE = os.path.join(STATE_DIR, "bct-chat.py")
 
+INBOX_DIR = os.path.join(STATE_DIR, "inbox")
+PROCESSING_DIR = os.path.join(STATE_DIR, "processing")
+DROPPED = os.path.join(STATE_DIR, "dropped.json")
+INBOX_CAP = 50              # a deeper queue means nobody has been home for a long time
+ORPHAN_AGE = 120            # a processing/ item older than this belonged to a dead hook
+
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
