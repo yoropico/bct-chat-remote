@@ -54,17 +54,25 @@ def sock_available():
 def rpc(cmd, args, pane_id="", timeout=10):
     """One request, one line-JSON reply, bounded by an OVERALL deadline — not a
     per-recv timeout, which a bridge dribbling bytes could keep resetting forever.
-    Blank lines are keepalives and are skipped; if two frames arrive in one read we
-    answer from the first; a bridge that accepts and closes without replying is a
-    socket error, not a malformed response."""
+    The deadline covers connect, the request write, and every read: connect gets
+    whatever of the budget remains (capped at 10s), and the socket is re-armed
+    with the remaining budget immediately before sendall so a slow accept can't
+    leave a stale, oversized timeout in force for the write. Blank lines are
+    keepalives and are skipped; if two frames arrive in one read we answer from
+    the first; a bridge that accepts and closes without replying is a socket
+    error, not a malformed response."""
     if tcp_target(SOCK) is None and not os.path.exists(SOCK):
         return {"ok": False, "error": f"socket not found: {SOCK} (ssh RemoteForward up?)"}
     deadline = time.time() + timeout
     try:
-        s = connect(min(timeout, 10))
+        s = connect(min(max(deadline - time.time(), 0), 10))
     except OSError as e:
         return {"ok": False, "error": f"socket error: {e}"}
     try:
+        left = deadline - time.time()
+        if left <= 0:
+            return {"ok": False, "error": "socket error: timed out waiting for the bridge"}
+        s.settimeout(left)
         s.sendall((json.dumps({"paneID": pane_id, "cmd": cmd, "args": args}) + "\n").encode())
         buf = b""
         while True:

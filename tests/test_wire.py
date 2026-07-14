@@ -125,6 +125,61 @@ class WireTests(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_rpc_deadline_covers_a_slow_connect_plus_the_send(self):
+        # A slow accept must not leave sendall free to burn a fresh, full-size
+        # timeout window of its own — one deadline covers connect AND the write,
+        # not just the recv loop.
+        class MuteServer:
+            """Accepts a connection and never reads or replies. Paired with a
+            payload too big to fit in the unread kernel buffers, this makes the
+            client's own sendall actually block."""
+
+            def __init__(self):
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.bind(("127.0.0.1", 0))
+                self.sock.listen(4)
+                self.port = self.sock.getsockname()[1]
+                self.conns = []
+                threading.Thread(target=self._serve, daemon=True).start()
+
+            def _serve(self):
+                while True:
+                    try:
+                        conn, _ = self.sock.accept()
+                    except OSError:
+                        return
+                    self.conns.append(conn)      # accepted; never .recv(), never replied
+
+            def close(self):
+                self.sock.close()
+                for c in self.conns:
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+
+        import time as t
+        srv = MuteServer()
+        try:
+            m = self.mod_for(srv.port)
+            real_connect = m.connect
+
+            def slow_connect(timeout=10):
+                t.sleep(1.2)                     # burns most of a timeout=2 budget
+                return real_connect(timeout)
+
+            m.connect = slow_connect
+            big_args = ["x" * (4 * 1024 * 1024)]  # too big for sendall to finish unread
+            started = t.time()
+            r = m.rpc("chat-list", big_args, timeout=2)
+            elapsed = t.time() - started
+            self.assertFalse(r["ok"])
+            self.assertIn("socket error", r["error"])
+            self.assertLess(elapsed, 3.0,
+                             f"rpc's deadline did not cover connect+send ({elapsed:.2f}s)")
+        finally:
+            srv.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,12 +49,16 @@ line of JSON out (`{"ok","text","error"}`).
   that a unix socket path exists on disk — a stale socket file left by an ssh
   reconnect without `StreamLocalBindUnlink` still exists but nothing is
   listening, and a plain existence check would read that as healthy.
-- `rpc()` is bounded by one **overall deadline** covering the whole call, not a
-  per-`recv` timeout that a bridge dribbling bytes (e.g. a keepalive) could keep
-  resetting forever. Blank lines are keepalives and are skipped; if a read
-  coalesces two JSON frames, `rpc()` answers from the first and discards the
-  rest. A bridge that accepts the connection and closes it without replying is
-  reported as a socket error, not a malformed response.
+- `rpc()` is bounded by one **overall deadline** covering the whole call —
+  connecting, writing the request, and every read — not a per-`recv` timeout
+  that a bridge dribbling bytes (e.g. a keepalive) could keep resetting
+  forever. A slow accept can't leave a stale, fresh-sized timeout in force for
+  the request write either: the socket is re-armed with whatever of the
+  deadline remains immediately before `sendall`. Blank lines are keepalives
+  and are skipped; if a read coalesces two JSON frames, `rpc()` answers from
+  the first and discards the rest. A bridge that accepts the connection and
+  closes it without replying is reported as a socket error, not a malformed
+  response.
 
 ## 4. Verbs
 
