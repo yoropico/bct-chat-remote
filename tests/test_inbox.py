@@ -9,7 +9,7 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_heartbeat import load_fresh_module  # noqa: E402
+from test_heartbeat_helpers import load_fresh_module  # noqa: E402
 
 
 class InboxTests(unittest.TestCase):

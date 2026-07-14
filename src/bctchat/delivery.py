@@ -27,42 +27,35 @@ def hook_session_id():
 
 
 def session_start():
-    """SessionStart hook: silent no-ops by design, but never silently absent — if we
-    have no seat yet (or one is already outstanding), press it forward through the join
-    budget, and keep a heartbeat running for as long as this host has a live claude
-    session. Detecting a *stale* identity (BCT restarted and forgot us while
-    identity.json still holds the old id) is the daemon's job, not this hook's — it
-    already probes on every tick and reacts on NOT_INVITED.
+    """SessionStart hook: mark this session live and make sure a daemon is running. It
+    touches no socket at all — joining the room, noticing a stale identity, and hearing
+    the room are all the daemon's job now. A hook that RPC'd here could be killed
+    mid-call (its timeout is smaller than the wire's worst case), and there is no ack
+    verb to recover what it had already consumed.
+
+    The marker is written BEFORE the spawn: the daemon's first act is to check
+    live_sessions(), so one spawned ahead of its own marker sees an empty set and exits
+    instantly.
 
     Invariant: this verb must always exit 0. hooks.json falls back from python3 to
     python on ANY nonzero exit (Windows lacks a reliable "is python3 the MS Store
     stub" test), so a die() escaping here would re-run the whole hook with stdin
-    already drained — no session id, no marker, no daemon, and a duplicate chat-join
-    banner. So nothing past ensure_stable_copy() may escape as an exception or a
-    SystemExit — the same (Exception, SystemExit) idiom do_heartbeat() already uses
-    for its own tick loop, applied here to the whole rest of the hook (mark_session()
-    included: a malformed session id could in principle still slip past
-    hook_session_id()'s own sanitizing, and this is the backstop for that). A join
-    failure specifically must still let spawn_heartbeat() run afterwards — a marker
-    with no daemon is a worse regression than either symptom alone — so that inner
-    step keeps its own narrower try immediately around the join call. The user-facing
-    verbs (send/read/wait/list/join/leave) keep die()'s normal nonzero-exit
-    behaviour."""
+    already drained — no session id, no marker, no daemon. So nothing past
+    ensure_stable_copy() may escape as an exception or a SystemExit — the same
+    (Exception, SystemExit) idiom do_daemon() uses for its own loop, applied here to the
+    whole rest of the hook (mark_session() included: a malformed session id could in
+    principle still slip past hook_session_id()'s own sanitizing, and this is the
+    backstop for that). The user-facing verbs (send/read/wait/list/join/leave) keep
+    die()'s normal nonzero-exit behaviour."""
     if os.environ.get("BCT_PANE_ID"):
         return                      # BCT pane — statusline auto-invite owns this
     ensure_stable_copy()
     try:
         sid = hook_session_id()
-        if not sock_available():
-            return                  # no ssh session forwarding the socket
-        if sid:
-            mark_session(sid)       # before spawning: the daemon exits on an empty set
-        try:
-            ensure_membership()     # no-op if seated; polls PENDING; else requests within budget
-        except (Exception, SystemExit):
-            pass                    # join failed — still spawn the heartbeat below
-        if sid:
-            spawn_heartbeat()
+        if not sid:
+            return                  # an interactive run is not a session — leave no marker
+        mark_session(sid)           # before spawning: the daemon exits on an empty set
+        ensure_daemon()
     except (Exception, SystemExit):
         pass                        # never let a hook verb trigger the python3->python fallback
 

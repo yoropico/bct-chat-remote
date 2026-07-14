@@ -161,11 +161,11 @@ def authed(cmd, args, timeout=10):
 def do_leave():
     """Leaving must STAY left. The old leave dropped the identity and walked away, so the
     daemon re-requested membership four minutes later. Suspending the budget is what makes
-    it stick: session_start() will happily respawn the heartbeat daemon after a leave
-    (spawn_heartbeat() has no suspension check, and there is no ensure_daemon() gate yet —
-    that's Task 6), but the respawned daemon finds may_request_join() False and never
-    re-requests — while the session markers survive, because they describe which claude
-    sessions are alive, and that is still true after leaving the room."""
+    it stick: suspended-and-unseated is both ensure_daemon()'s refusal to spawn and the
+    running daemon's exit condition, and even a daemon that outlives them finds
+    may_request_join() False and never re-requests — while the session markers survive,
+    because they describe which claude sessions are alive, and that is still true after
+    leaving the room."""
     r = rpc("chat-leave", [], identity())
     forget(IDENTITY)
     forget(PENDING)

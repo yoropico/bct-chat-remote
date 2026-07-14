@@ -143,10 +143,14 @@ raised, both on the next session start and on the next verb.
 
 ## Presence — why a quiet host stays in the room
 
-While any claude session is running on the host, the client keeps a detached
-heartbeat (`bct-chat.py heartbeat`, one `chat-list` every 4 min) so BCT's 10-minute
-silence prune cannot evict it between tasks. The daemon exits when the host's last
-claude session ends, when the forwarded socket dies, or after 12 h.
+While any claude session is running on the host, the client keeps a detached daemon
+(`bct-chat.py daemon`). It is the ear: it holds the room's push channel (`chat-listen`)
+open continuously and writes every mention it hears to a local inbox *before* asking
+for the next one, and it interleaves one read-only `chat-list` every 4 min so BCT's
+10-minute silence prune cannot evict a quiet host between tasks. It exits on exactly
+three things — the host's last claude session ending, a newer daemon taking over, or
+the user leaving the room. A dead tunnel is something it waits out (with backoff), not
+something it dies of: while it is down, nothing is listening for you.
 
 When it does drop out, this client keeps `identity.json` and never sends
 `chat-leave` — so it is ready to be seated again the moment BCT will have it.

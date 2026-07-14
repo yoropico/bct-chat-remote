@@ -68,24 +68,7 @@ def main(argv):
         print(r.get("text", ""))
     elif verb == "leave":
         do_leave()
-    elif verb == "heartbeat":
-        interval, max_uptime = HEARTBEAT_INTERVAL, HEARTBEAT_MAX_UPTIME
-        if "--interval" in rest:
-            i = rest.index("--interval")
-            if i + 1 >= len(rest):
-                die("heartbeat --interval <seconds>")
-            try:
-                interval = float(rest[i + 1])
-            except ValueError:
-                die("heartbeat --interval <seconds>")
-        if "--max-uptime" in rest:
-            i = rest.index("--max-uptime")
-            if i + 1 >= len(rest):
-                die("heartbeat --max-uptime <seconds>")
-            try:
-                max_uptime = float(rest[i + 1])
-            except ValueError:
-                die("heartbeat --max-uptime <seconds>")
-        do_heartbeat(interval, max_uptime)
+    elif verb == "daemon":
+        do_daemon()                           # spawned by the hooks; not for humans
     else:
         die(f"unknown verb: {verb}")

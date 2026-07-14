@@ -4,7 +4,7 @@ on the reconnect sentinel, surface errors. A held connection needs a longer
 socket timeout than the default 10s."""
 import contextlib, io, os, sys, tempfile, unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_heartbeat import load_fresh_module  # noqa: E402
+from test_heartbeat_helpers import load_fresh_module  # noqa: E402
 
 IDENT = "C1A6063F-0124-4229-9CE3-D757348A70F2"
 

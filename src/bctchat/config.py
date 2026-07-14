@@ -9,7 +9,7 @@ Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
 import json, os, re, socket, subprocess, sys, time
 
-ARTIFACT = os.path.abspath(__file__)   # the concatenated single file; what spawn_heartbeat re-execs
+ARTIFACT = os.path.abspath(__file__)   # the concatenated single file; what ensure_daemon re-execs
 
 if hasattr(sys.stdout, "reconfigure"):
     # Wire and room text are UTF-8; never trust the locale (Korean Windows = cp949).
@@ -32,9 +32,16 @@ NO_NEW = "(새 메시지 없음)"
 NO_MENTION = "(새 멘션 없음)"          # chat-listen timeout sentinel (server push)
 NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
+MARKER_TTL = 7 * 86400          # a marker with no pid to probe (Windows) ages out this slowly:
+                                 # GC'ing a LIVE session's marker costs it its ear, while a
+                                 # leaked one only costs a phantom seat — so err long
 PIDFILE = os.path.join(STATE_DIR, "heartbeat.pid")
-HEARTBEAT_INTERVAL = 240        # 4 min — comfortably inside BCT's 10-min prune window
-HEARTBEAT_MAX_UPTIME = 43200    # 12 h — backstop for a marker leaked by a crashed session
+PIDFILE_STALE = 90              # pidfile mtime older than this = no daemon (with proc_alive)
+PRESENCE_INTERVAL = 240         # 4 min — comfortably inside BCT's 10-min prune window
+LISTEN_TIMEOUT = 40             # BCT holds chat-listen ~30s; 40 covers the hold plus slack
+BACKOFF_MIN = 60                # a dead tunnel is waited out, never died of
+BACKOFF_MAX = 300
+JOIN_POLL = 15                  # while unseated: how long between join/poll attempts
 
 STABLE = os.path.join(STATE_DIR, "bct-chat.py")
 

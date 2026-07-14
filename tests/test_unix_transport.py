@@ -13,7 +13,7 @@ import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_heartbeat import load_fresh_module  # noqa: E402
+from test_heartbeat_helpers import load_fresh_module  # noqa: E402
 from test_tcp_transport import CLIENT  # noqa: E402
 
 unix_only = unittest.skipUnless(hasattr(socket, "AF_UNIX"), "no AF_UNIX on this platform")

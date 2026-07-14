@@ -103,9 +103,30 @@ def ensure_stable_copy():
         pass                        # best-effort; never block session start
 
 
+def claude_pid():
+    """Best-effort pid of the claude process this hook belongs to. The hook's own parent
+    is the `sh -c` wrapper hooks.json needs for its `||` fallback, and that shell exits the
+    moment we do — so we look one further up. POSIX only: on Windows there is no cheap
+    ancestor walk, and 0 means 'no pid liveness for this marker' (gc_markers falls back to
+    MARKER_TTL there). A wrong guess would GC a LIVE session's marker, so we only trust an
+    ancestor that still exists at the moment we ask."""
+    if os.name == "nt":
+        return 0
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(os.getppid())],
+                             capture_output=True, text=True, timeout=3)
+        pid = int(out.stdout.strip())
+    except Exception:
+        return 0
+    return pid if pid > 1 and proc_alive(pid) else 0
+
+
 def mark_session(sid):
+    """One marker per live claude session on this host — the daemon's refcount. The pid
+    lets a crashed session's marker be collected; the mtime (refreshed by every hook of
+    that session) is the fallback where no pid is available."""
     os.makedirs(SESSIONS_DIR, exist_ok=True)
-    open(os.path.join(SESSIONS_DIR, sid), "w").close()
+    save(os.path.join(SESSIONS_DIR, sid), {"pid": claude_pid(), "startedAt": time.time()})
 
 
 def unmark_session(sid):
@@ -113,8 +134,7 @@ def unmark_session(sid):
 
 
 def live_sessions():
-    """One marker per live claude session on this host — the daemon's refcount."""
     try:
-        return os.listdir(SESSIONS_DIR)
+        return sorted(os.listdir(SESSIONS_DIR))
     except OSError:
         return []
