@@ -1,11 +1,6 @@
 """Heartbeat daemon: proves this host is alive while any claude session on it is."""
 import json, os, re, socket, subprocess, sys, time
 
-from bctchat.config import *
-from bctchat.wire import *
-from bctchat.state import *
-from bctchat.membership import *
-
 
 def heartbeat_alive():
     """Is a daemon running? Its pid file's mtime is refreshed every tick, so a stale

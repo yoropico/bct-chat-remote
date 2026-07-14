@@ -1,12 +1,6 @@
 """Hook entry points: SessionStart/SessionEnd/Stop/UserPromptSubmit digest delivery."""
 import json, os, re, socket, subprocess, sys, time
 
-from bctchat.config import *
-from bctchat.wire import *
-from bctchat.state import *
-from bctchat.membership import *
-from bctchat.presence import *
-
 
 def hook_session_id():
     """claude-code pipes the hook payload as JSON on stdin. An interactive run has a

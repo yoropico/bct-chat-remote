@@ -24,6 +24,7 @@ STALE_ID = "03AD4294-8854-4208-9417-269788BF9E64"
 def run_session_start(home, sock_spec):
     env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
     env["HOME"] = home
+    env["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     env["BCT_CHAT_SOCK"] = sock_spec
     return subprocess.run([sys.executable, CLIENT, "session-start"],
                           env=env, capture_output=True, text=True, timeout=30)

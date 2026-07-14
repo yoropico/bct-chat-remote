@@ -21,6 +21,7 @@ NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 def run(args, home, sock_spec):
     env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
     env["HOME"] = home
+    env["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     env["BCT_CHAT_SOCK"] = sock_spec
     return subprocess.run([sys.executable, CLIENT] + args, env=env,
                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)

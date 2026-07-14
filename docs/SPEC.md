@@ -33,6 +33,10 @@ All under `~/.bct-chat/` (override the whole directory with `$BCT_CHAT_HOME`):
 | `heartbeat.pid` | the presence daemon's pidfile; its mtime is the liveness signal |
 | `bct-chat.py` | the stable copy |
 
+Every write under this directory is atomic (temp file + `os.replace`, atomic on both
+POSIX and Windows): a hook killed mid-write can never leave a 0-byte `identity.json`
+or a truncated stable copy.
+
 ## 3. Transport
 
 `$BCT_CHAT_SOCK` (default `~/.bct-chat.sock`, the ssh-`RemoteForward`ed BCT
@@ -106,6 +110,7 @@ with `python3 ~/.bct-chat/bct-chat.py send "<답변>"`.
 
 ## 9. Platforms
 
-macOS, Linux (AF_UNIX) and Windows (`tcp:`). Nothing may call `os.kill(pid, 0)` on
-Windows: CPython maps `os.kill` to `TerminateProcess` there for any signal, so
-probing a process would kill it.
+macOS, Linux (AF_UNIX) and Windows (`tcp:`). Process liveness is always probed via
+`proc_alive()`, never `os.kill(pid, 0)` directly on Windows: CPython maps `os.kill`
+to `TerminateProcess` there for any signal, so probing a process would kill it.
+`proc_alive()` uses `OpenProcess`/`CloseHandle` via `ctypes` on Windows instead.

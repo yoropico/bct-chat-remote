@@ -1,13 +1,6 @@
 """Entry point: argv dispatch for the join/send/read/... verbs and hook shims."""
 import json, os, re, socket, subprocess, sys, time
 
-from bctchat.config import *
-from bctchat.wire import *
-from bctchat.state import *
-from bctchat.membership import *
-from bctchat.presence import *
-from bctchat.delivery import *
-
 
 def die(msg):
     print(msg, file=sys.stderr)

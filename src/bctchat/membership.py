@@ -1,11 +1,6 @@
 """Join/cooldown/identity: requesting, polling and holding room membership."""
 import json, os, re, socket, subprocess, sys, time
 
-from bctchat.config import *
-from bctchat.wire import *
-from bctchat.state import *
-from bctchat.cli import *
-
 
 def cooldown_remaining():
     """Seconds until an automatic join request is allowed again (0 = now)."""

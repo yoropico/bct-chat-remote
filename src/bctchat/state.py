@@ -1,8 +1,6 @@
 """Local state: identity/pending/cooldown JSON files, the stable copy, session markers."""
 import json, os, re, socket, subprocess, sys, time
 
-from bctchat.config import *
-
 
 def load(path):
     try:
@@ -12,10 +10,24 @@ def load(path):
         return None
 
 
+def atomic_write(path, text):
+    """temp + os.replace: os.replace is atomic on POSIX and on Windows. A hook killed
+    mid-write can then never leave a 0-byte identity.json or a truncated stable copy
+    (which is the very file the skill tells claude to run)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        forget(tmp)
+        raise
+
+
 def save(path, obj):
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f)
+    atomic_write(path, json.dumps(obj, ensure_ascii=False))
 
 
 def forget(path):
@@ -25,10 +37,42 @@ def forget(path):
         pass
 
 
+def proc_alive(pid):
+    """Is this pid a live process? NEVER os.kill(pid, 0) on Windows — CPython maps
+    os.kill to TerminateProcess there for ANY signal, i.e. probing would kill it."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        # AttributeError/ImportError/OSError all mean "could not ask" here — never
+        # fall through to the POSIX branch below, which would reach os.kill.
+        try:
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+            if not h:
+                return False
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+        except (AttributeError, ImportError, OSError):
+            return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, owned by someone else
+    except OSError:
+        return False
+
+
 def ensure_stable_copy():
-    """Plugin installs live under a versioned cache path; keep one canonical
-    copy at ~/.bct-chat/bct-chat.py for the skill prose and manual use."""
-    me = os.path.abspath(__file__)
+    """Plugin installs live under a versioned cache path; keep one canonical copy at
+    ~/.bct-chat/bct-chat.py for the skill prose and manual use. Guarded against EVERY
+    exception, not just OSError: a truncated (pre-atomic-write) copy raises
+    UnicodeDecodeError, which would exit the hook nonzero and trigger hooks.json's
+    `|| python` re-run with stdin already drained."""
+    me = ARTIFACT
     if me == os.path.abspath(STABLE):
         return
     try:
@@ -38,13 +82,11 @@ def ensure_stable_copy():
             with open(STABLE, encoding="utf-8") as f:
                 if f.read() == src:
                     return
-        except OSError:
+        except Exception:
             pass
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(STABLE, "w", encoding="utf-8") as f:
-            f.write(src)
+        atomic_write(STABLE, src)
         os.chmod(STABLE, 0o755)
-    except OSError:
+    except Exception:
         pass                        # best-effort; never block session start
 
 

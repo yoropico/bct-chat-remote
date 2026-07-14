@@ -16,7 +16,10 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-STATE_DIR = os.path.expanduser("~/.bct-chat")
+# BCT_CHAT_HOME overrides the state dir. This is what makes the test suite safe on
+# Windows: ntpath.expanduser() ignores HOME and reads USERPROFILE, so an HOME-isolated
+# test would run against the developer's REAL ~/.bct-chat and SIGKILL their live daemon.
+STATE_DIR = os.environ.get("BCT_CHAT_HOME") or os.path.expanduser("~/.bct-chat")
 IDENTITY = os.path.join(STATE_DIR, "identity.json")
 PENDING = os.path.join(STATE_DIR, "pending-join.json")
 COOLDOWN = os.path.join(STATE_DIR, "join-cooldown.json")

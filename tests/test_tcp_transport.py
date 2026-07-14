@@ -67,6 +67,7 @@ def free_port():
 def run_client(args, home, sock_spec):
     env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
     env["HOME"] = home
+    env["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     env["BCT_CHAT_SOCK"] = sock_spec
     return subprocess.run([sys.executable, CLIENT] + args,
                           env=env, capture_output=True, text=True, timeout=30)
@@ -94,7 +95,8 @@ class TcpTransportTests(unittest.TestCase):
         srv = FakeChatServer(lambda req: {"ok": True, "text": "hi 🎉"})
         try:
             env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
-            env.update(HOME=self.home, BCT_CHAT_SOCK=f"tcp:127.0.0.1:{srv.port}",
+            env.update(HOME=self.home, BCT_CHAT_HOME=os.path.join(self.home, ".bct-chat"),
+                       BCT_CHAT_SOCK=f"tcp:127.0.0.1:{srv.port}",
                        LC_ALL="C", PYTHONCOERCECLOCALE="0", PYTHONUTF8="0")
             r = subprocess.run([sys.executable, "-X", "utf8=0", CLIENT, "read"],
                                env=env, capture_output=True, timeout=30)

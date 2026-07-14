@@ -20,28 +20,30 @@ NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 
 
 def load_fresh_module(home):
-    """A standalone bct-chat module instance whose STATE_DIR/PIDFILE/etc (computed
-    at import time from ~) resolve under `home`. Lets a test drive do_heartbeat(),
-    heartbeat_alive(), spawn_heartbeat() directly in-process — deterministic, no
-    subprocess/timing — and monkeypatch its I/O-boundary functions (sock_available,
-    rpc, subprocess) without touching the real shared modules other tests use."""
-    old_home = os.environ.get("HOME")
+    """A standalone bct-chat module instance whose STATE_DIR/PIDFILE/etc (computed at
+    import time) resolve under `home`. BCT_CHAT_HOME — not HOME — is the isolation
+    knob: on Windows, expanduser("~") ignores HOME and would hand back the developer's
+    real profile."""
+    old = {k: os.environ.get(k) for k in ("HOME", "BCT_CHAT_HOME")}
     os.environ["HOME"] = home
+    os.environ["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     try:
         spec = importlib.util.spec_from_file_location(f"bct_chat_{id(home)}", CLIENT)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
     finally:
-        if old_home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = old_home
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def start_daemon(home, sock_spec, interval="0.2", max_uptime="30"):
     env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
     env["HOME"] = home
+    env["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     env["BCT_CHAT_SOCK"] = sock_spec
     return subprocess.Popen([sys.executable, CLIENT, "heartbeat",
                              "--interval", interval, "--max-uptime", max_uptime],
@@ -344,6 +346,7 @@ class HeartbeatTests(unittest.TestCase):
         # Matches wait --timeout's validation: no raw IndexError traceback.
         env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
         env["HOME"] = self.home
+        env["BCT_CHAT_HOME"] = os.path.join(self.home, ".bct-chat")
         env["BCT_CHAT_SOCK"] = f"tcp:127.0.0.1:{free_port()}"
         r = subprocess.run([sys.executable, CLIENT, "heartbeat", "--interval"],
                             env=env, capture_output=True, text=True, timeout=10)

@@ -20,6 +20,7 @@ from test_tcp_transport import CLIENT, FakeChatServer  # noqa: E402
 def run_hook(verb, home, sock_spec, payload):
     env = {k: v for k, v in os.environ.items() if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
     env["HOME"] = home
+    env["BCT_CHAT_HOME"] = os.path.join(home, ".bct-chat")
     env["BCT_CHAT_SOCK"] = sock_spec
     return subprocess.run([sys.executable, CLIENT, verb], env=env, input=payload,
                           capture_output=True, text=True, timeout=30)
@@ -236,9 +237,11 @@ class SessionMarkerTests(unittest.TestCase):
         confirm a live daemon actually resulted, not just a recorded call."""
         srv = FakeChatServer(lambda req: {"ok": True, "text": "roster"})
         old_home = os.environ.get("HOME")
+        old_chat_home = os.environ.get("BCT_CHAT_HOME")
         old_sock = os.environ.get("BCT_CHAT_SOCK")
         old_pane = os.environ.pop("BCT_PANE_ID", None)
         os.environ["HOME"] = self.home
+        os.environ["BCT_CHAT_HOME"] = os.path.join(self.home, ".bct-chat")
         os.environ["BCT_CHAT_SOCK"] = f"tcp:127.0.0.1:{srv.port}"
         try:
             spec = importlib.util.spec_from_file_location(f"bct_chat_{id(self)}", CLIENT)
@@ -288,6 +291,10 @@ class SessionMarkerTests(unittest.TestCase):
                 os.environ.pop("HOME", None)
             else:
                 os.environ["HOME"] = old_home
+            if old_chat_home is None:
+                os.environ.pop("BCT_CHAT_HOME", None)
+            else:
+                os.environ["BCT_CHAT_HOME"] = old_chat_home
             if old_sock is None:
                 os.environ.pop("BCT_CHAT_SOCK", None)
             else:

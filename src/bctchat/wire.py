@@ -1,8 +1,6 @@
 """Wire transport: unix socket (or TCP fallback) connection to the BCT bridge."""
 import json, os, re, socket, subprocess, sys, time
 
-from bctchat.config import *
-
 
 def tcp_target(spec):
     """$BCT_CHAT_SOCK=tcp:<host>:<port> -> (host, port); None means unix path."""

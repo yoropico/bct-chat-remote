@@ -20,7 +20,10 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-STATE_DIR = os.path.expanduser("~/.bct-chat")
+# BCT_CHAT_HOME overrides the state dir. This is what makes the test suite safe on
+# Windows: ntpath.expanduser() ignores HOME and reads USERPROFILE, so an HOME-isolated
+# test would run against the developer's REAL ~/.bct-chat and SIGKILL their live daemon.
+STATE_DIR = os.environ.get("BCT_CHAT_HOME") or os.path.expanduser("~/.bct-chat")
 IDENTITY = os.path.join(STATE_DIR, "identity.json")
 PENDING = os.path.join(STATE_DIR, "pending-join.json")
 COOLDOWN = os.path.join(STATE_DIR, "join-cooldown.json")
@@ -46,7 +49,6 @@ REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat
 # ---- wire --------------------------------------------------------------
 """Wire transport: unix socket (or TCP fallback) connection to the BCT bridge."""
 import json, os, re, socket, subprocess, sys, time
-
 
 
 def tcp_target(spec):
@@ -110,7 +112,6 @@ def rpc(cmd, args, pane_id="", timeout=10):
 import json, os, re, socket, subprocess, sys, time
 
 
-
 def load(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -119,10 +120,24 @@ def load(path):
         return None
 
 
+def atomic_write(path, text):
+    """temp + os.replace: os.replace is atomic on POSIX and on Windows. A hook killed
+    mid-write can then never leave a 0-byte identity.json or a truncated stable copy
+    (which is the very file the skill tells claude to run)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        forget(tmp)
+        raise
+
+
 def save(path, obj):
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f)
+    atomic_write(path, json.dumps(obj, ensure_ascii=False))
 
 
 def forget(path):
@@ -132,10 +147,42 @@ def forget(path):
         pass
 
 
+def proc_alive(pid):
+    """Is this pid a live process? NEVER os.kill(pid, 0) on Windows — CPython maps
+    os.kill to TerminateProcess there for ANY signal, i.e. probing would kill it."""
+    if not pid or pid <= 0:
+        return False
+    if os.name == "nt":
+        # AttributeError/ImportError/OSError all mean "could not ask" here — never
+        # fall through to the POSIX branch below, which would reach os.kill.
+        try:
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+            if not h:
+                return False
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+        except (AttributeError, ImportError, OSError):
+            return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, owned by someone else
+    except OSError:
+        return False
+
+
 def ensure_stable_copy():
-    """Plugin installs live under a versioned cache path; keep one canonical
-    copy at ~/.bct-chat/bct-chat.py for the skill prose and manual use."""
-    me = os.path.abspath(__file__)
+    """Plugin installs live under a versioned cache path; keep one canonical copy at
+    ~/.bct-chat/bct-chat.py for the skill prose and manual use. Guarded against EVERY
+    exception, not just OSError: a truncated (pre-atomic-write) copy raises
+    UnicodeDecodeError, which would exit the hook nonzero and trigger hooks.json's
+    `|| python` re-run with stdin already drained."""
+    me = ARTIFACT
     if me == os.path.abspath(STABLE):
         return
     try:
@@ -145,13 +192,11 @@ def ensure_stable_copy():
             with open(STABLE, encoding="utf-8") as f:
                 if f.read() == src:
                     return
-        except OSError:
+        except Exception:
             pass
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(STABLE, "w", encoding="utf-8") as f:
-            f.write(src)
+        atomic_write(STABLE, src)
         os.chmod(STABLE, 0o755)
-    except OSError:
+    except Exception:
         pass                        # best-effort; never block session start
 
 
@@ -179,7 +224,6 @@ def live_sessions():
 # ---- membership --------------------------------------------------------
 """Join/cooldown/identity: requesting, polling and holding room membership."""
 import json, os, re, socket, subprocess, sys, time
-
 
 
 def cooldown_remaining():
@@ -288,7 +332,6 @@ def authed(cmd, args, timeout=10):
 import json, os, re, socket, subprocess, sys, time
 
 
-
 def heartbeat_alive():
     """Is a daemon running? Its pid file's mtime is refreshed every tick, so a stale
     file (crashed daemon) ages out. NEVER probe the pid with os.kill(pid, 0) — on
@@ -389,7 +432,6 @@ def do_heartbeat(interval, max_uptime):
 # ---- delivery ----------------------------------------------------------
 """Hook entry points: SessionStart/SessionEnd/Stop/UserPromptSubmit digest delivery."""
 import json, os, re, socket, subprocess, sys, time
-
 
 
 def hook_session_id():
@@ -577,7 +619,6 @@ def prompt_submit_hook():
 # ---- cli ---------------------------------------------------------------
 """Entry point: argv dispatch for the join/send/read/... verbs and hook shims."""
 import json, os, re, socket, subprocess, sys, time
-
 
 
 def die(msg):
