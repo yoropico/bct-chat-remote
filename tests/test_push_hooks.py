@@ -50,12 +50,14 @@ class DeliveryTests(unittest.TestCase):
         self.mod.subprocess = FakeSub
         os.environ.pop("BCT_PANE_ID", None)
         os.environ.pop("BCT_CHAT_MODE", None)
+        os.environ.pop("BCT_CHAT_STANDBY", None)
 
     def tearDown(self):
         breaches = self.socket_calls
         shutil.rmtree(self.home, ignore_errors=True)
         os.environ.pop("BCT_CHAT_MODE", None)
         os.environ.pop("BCT_PANE_ID", None)
+        os.environ.pop("BCT_CHAT_STANDBY", None)
         self.assertEqual(breaches, [], "a delivery hook touched the socket")
 
     def run_verb(self, fn):
@@ -82,6 +84,50 @@ class DeliveryTests(unittest.TestCase):
         self.assertIn("once", self.run_verb(self.mod.stop_hook))
         self.assertEqual(self.run_verb(self.mod.stop_hook), "")
         self.assertEqual(os.listdir(self.mod.PROCESSING_DIR), [])
+
+    def test_an_item_whose_print_dies_is_not_lost(self):
+        """deliver() prints the digest and THEN acks (deletes the processing/ file) — that
+        ordering IS the at-least-once contract. Swap it (ack, then print) and a crash
+        between the two turns a harmless duplicate into a silent loss, and no test that
+        merely calls print() would catch the swap: print() never fails under
+        redirect_stdout, so it can't stand in for "the output step blew up". json.dumps()
+        — which deliver() calls to build the block-JSON before printing it — is the lever
+        that actually can fail without print() itself being touched."""
+        self.mod.inbox_put("boom", "svr")
+
+        # self.mod.json IS the real stdlib json module (one shared object, not a
+        # per-module copy), so a blanket "always raise" stub would also break
+        # save(CHAIN, ...) — which stop_hook() calls BEFORE deliver() — and the item
+        # would never even reach deliver()'s print/ack step at all, making this test
+        # pass for the wrong reason. Raise only for the block-JSON shape deliver()
+        # builds, and restore the real dumps() via addCleanup so no other test run in
+        # this process (json.dumps is global) is affected.
+        real_dumps = self.mod.json.dumps
+
+        def raiser(obj, *a, **k):
+            if isinstance(obj, dict) and obj.get("decision") == "block":
+                raise OSError("stdout gone")
+            return real_dumps(obj, *a, **k)
+
+        self.addCleanup(setattr, self.mod.json, "dumps", real_dumps)
+        self.mod.json.dumps = raiser
+        self.run_verb(self.mod.stop_hook)
+        self.assertEqual(len(os.listdir(self.mod.PROCESSING_DIR)), 1,
+                          "an item whose delivery blew up must stay recoverable")
+
+    def test_a_prompt_submit_item_whose_digest_build_fails_is_not_lost(self):
+        """The equivalent guard for prompt_submit_hook()'s own print-then-ack: it builds
+        the digest with compose_digest(), prints it, and only then acks. A failure while
+        building the digest must leave the item in processing/, not acked away."""
+        self.mod.inbox_put("boom", "svr")
+
+        def raiser(*a, **k):
+            raise OSError("digest build blew up")
+
+        self.mod.compose_digest = raiser
+        self.run_verb(self.mod.prompt_submit_hook)
+        self.assertEqual(len(os.listdir(self.mod.PROCESSING_DIR)), 1,
+                          "an item whose digest build blew up must stay recoverable")
 
     def test_standby_mode_waits_for_an_item(self):
         os.environ["BCT_CHAT_MODE"] = "standby"
@@ -138,6 +184,14 @@ class DeliveryTests(unittest.TestCase):
         self.mod.inbox_put("m0", "svr")
         self.mod.save(self.mod.CHAIN, {"n": self.mod.CHAIN_CAP})
         self.assertIn("m0", self.run_verb(self.mod.prompt_submit_hook))
+        self.assertIsNone(self.mod.load(self.mod.CHAIN))
+
+    def test_a_prompt_submit_resets_the_chain_even_with_an_empty_inbox(self):
+        """The reset must not be conditional on there being anything to deliver: the user
+        prompting IS the reset, regardless of whether a mention happens to be waiting.
+        An empty inbox must not leave a stale chain.json capping the user's own turn."""
+        self.mod.save(self.mod.CHAIN, {"n": self.mod.CHAIN_CAP})
+        self.assertEqual(self.run_verb(self.mod.prompt_submit_hook), "")
         self.assertIsNone(self.mod.load(self.mod.CHAIN))
 
     def test_prompt_submit_prints_the_digest_as_context(self):
@@ -200,6 +254,16 @@ class DeliveryTests(unittest.TestCase):
         self.assertLess(len(reason.splitlines()), 12)
         self.assertIn("생략", reason)
 
+    def test_reply_hint_survives_a_line_longer_than_the_byte_cap(self):
+        """A single mention line longer than DIGEST_MAX_BYTES must not take REPLY_HINT
+        down with it when the byte cap slices the text — that would hand claude a
+        blocked turn showing a mention with no instruction for how to answer it. The
+        byte budget applies to the body only; REPLY_HINT is appended after truncation."""
+        self.mod.DIGEST_MAX_BYTES = 200
+        self.mod.inbox_put("x" * 5000, "svr")
+        reason = json.loads(self.run_verb(self.mod.stop_hook))["reason"]
+        self.assertIn(self.mod.REPLY_HINT, reason)
+
     def test_dropped_mentions_are_announced_in_the_next_digest(self):
         self.mod.INBOX_CAP = 2
         for i in range(4):
@@ -220,6 +284,24 @@ class DeliveryTests(unittest.TestCase):
             os.environ["BCT_CHAT_MODE"] = standby
             self.assertEqual(self.mod.chat_mode(), "standby")
         os.environ["BCT_CHAT_MODE"] = "nonsense"
+        self.assertEqual(self.mod.chat_mode(), "work")
+
+    def test_the_legacy_standby_variable_means_what_it_says(self):
+        """BCT_CHAT_STANDBY is the pre-BCT_CHAT_MODE variable. Both arms of its old
+        handling returned "work", so it had silently stopped doing anything at all — a
+        user who had set BCT_CHAT_STANDBY=1 to opt INTO standby got demoted to work mode
+        with no warning. A truthy value must enable standby; only a recognized disable
+        spelling (or leaving it unset) should fall back to work."""
+        for truthy in ("1", "true", "yes", "on", "anything"):
+            os.environ["BCT_CHAT_STANDBY"] = truthy
+            self.assertEqual(self.mod.chat_mode(), "standby", f"BCT_CHAT_STANDBY={truthy!r}")
+        for falsy in ("0", "off", "false", "no"):
+            os.environ["BCT_CHAT_STANDBY"] = falsy
+            self.assertEqual(self.mod.chat_mode(), "work", f"BCT_CHAT_STANDBY={falsy!r}")
+
+    def test_chat_mode_wins_over_the_legacy_variable_when_set(self):
+        os.environ["BCT_CHAT_STANDBY"] = "1"                # legacy says standby
+        os.environ["BCT_CHAT_MODE"] = "work"                # explicit says work
         self.assertEqual(self.mod.chat_mode(), "work")
 
     def test_a_broken_inbox_never_breaks_the_turn(self):

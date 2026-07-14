@@ -96,8 +96,11 @@ The four hook verbs are wired in `hooks/hooks.json`.
   already drained — no session id, no marker, no daemon. Every hook swallows
   `Exception` and `SystemExit` alike.
 - **Invariant: a hook is silent unless it has something to deliver.**
-- **Invariant: no hook ever writes `dropped.json`.** It has exactly one writer —
-  the daemon's cap eviction (§6) — and a second one reintroduces a lost-update race.
+- **Invariant: no hook ever *increments* `dropped.json`.** Hooks DO touch the file —
+  `take_dropped()` reads and clears it for the next digest, which is its designed
+  consumer — but the counter itself has exactly one writer, the daemon's cap eviction
+  (§6); a hook calling `inbox_put()` or `_bump_dropped()` would reintroduce a
+  lost-update race.
 - Inside a BCT pane (`$BCT_PANE_ID` set) every hook verb is a complete no-op — it
   claims nothing, spawns nothing. BCT's native chat injection owns delivery there.
 - Every hook is a **daemon spawn point** (`ensure_daemon()`), and every hook that
@@ -125,10 +128,17 @@ The four hook verbs are wired in `hooks/hooks.json`.
 
 A working session pays nothing per turn; only an idle session that opted into
 `standby` waits, and it waits on the local filesystem. `BCT_CHAT_STANDBY` survives as
-a legacy disable value. `hooks.json` gives `Stop` a 960 s timeout to cover the
-900 s hold with slack; the other three hooks do no RPC and never hold, so 10 s is
-generous. (Claude Code honours a hook `timeout` as written — its config schema
-imposes no maximum and the command spawn uses the value directly — but it does clamp
+a legacy variable, and it means what it says: a truthy value (anything other than the
+disable spellings `0`/`off`/`false`/`no`, or unset) turns standby on; `BCT_CHAT_MODE`
+wins whenever it holds a recognized value. `hooks.json` gives `Stop` a 960 s timeout to
+cover the 900 s hold with slack; the other three hooks do no RPC and never hold, so
+10 s is generous. Claude Code's hook config schema imposes no maximum on `timeout`, and
+the command spawn passes the value straight through as the process deadline — but
+whether a *running* Claude Code actually honours a 960 s `Stop` timeout has **not been
+confirmed against the real harness**; this is inferred from the schema and spawn code,
+not observed. If Claude Code clamps it, standby simply ends early — no mention is lost
+either way, because `inbox_wait()` claims and returns in the same breath and
+`recover_orphans()` reclaims anything caught in that window. (Claude Code does clamp
 its *`SessionEnd` shutdown wait* to 60 s, so `SessionEnd` must stay well under that.)
 
 **Chain cap.** `stop_hook_active` in the Stop payload means the turn is only
@@ -343,8 +353,11 @@ as BCT returned them, then `REPLY_HINT` — the instruction telling claude to an
 with `python3 ~/.bct-chat/bct-chat.py send "<답변>"`.
 
 It is capped: `DIGEST_MAX_LINES` (200) keeps only the most recent lines, and
-`DIGEST_MAX_BYTES` (16 KB) bounds the whole thing — a backlog that rotted for hours
-must not dump 4000 lines into a turn. Anything the inbox cap threw away since the last
+`DIGEST_MAX_BYTES` (16 KB) bounds the identity line and room lines — a backlog that
+rotted for hours must not dump 4000 lines into a turn. `REPLY_HINT` is appended
+*after* that byte cap is applied, never before it, so it always survives: a single
+mention line longer than `DIGEST_MAX_BYTES` truncates the room text, never the
+instruction for how to answer it. Anything the inbox cap threw away since the last
 digest is announced first, as `(오래된 멘션 N건 생략)`. `stop-hook` emits the digest as
 `{"decision": "block", "reason": …}`; `prompt-submit` prints it plain.
 

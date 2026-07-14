@@ -15,14 +15,20 @@ INBOX_POLL = 1.0
 
 def chat_mode():
     """work (default): the Stop hook returns in milliseconds. standby: it waits on the
-    inbox locally for up to STANDBY_HOLD — zero tokens, zero RPC."""
+    inbox locally for up to STANDBY_HOLD — zero tokens, zero RPC.
+
+    BCT_CHAT_MODE wins whenever it holds a recognized value. BCT_CHAT_STANDBY is the
+    legacy variable, and it means what it says: a truthy value (anything other than
+    the disable spellings below, or unset) turns standby ON. Treating every legacy
+    value as "work" — the bug this replaces — silently defeated any pre-existing
+    BCT_CHAT_STANDBY=1 the moment this code shipped."""
     v = os.environ.get("BCT_CHAT_MODE", "").strip().lower()
     if v in ("standby", "work"):
         return v
     legacy = os.environ.get("BCT_CHAT_STANDBY", "").strip().lower()
-    if legacy in ("0", "off", "false", "no"):
+    if legacy in ("0", "off", "false", "no", ""):
         return "work"
-    return "work"
+    return "standby"
 
 
 def hook_payload():
@@ -64,7 +70,12 @@ def remark_session(payload):
 def compose_digest(item, dropped=0):
     """Mirror BCT's local chatInjection shape: identity line, the room lines exactly as BCT
     returned them, then the reply instruction. Capped — a backlog that rotted for hours must
-    not dump 4000 lines into a turn."""
+    not dump 4000 lines into a turn.
+
+    The byte cap is applied to the identity+room-lines body ONLY, and REPLY_HINT is
+    appended after truncation, never before it: a single mention line longer than
+    DIGEST_MAX_BYTES must not slice REPLY_HINT away along with it, which would hand
+    claude a blocked turn with a mention and no instruction for how to answer it."""
     name = item.get("name") or default_name()
     lines = [f"[bct-chat] 단체 채팅방 — 당신은 @{name} 입니다. 새 메시지:"]
     if dropped:
@@ -74,11 +85,13 @@ def compose_digest(item, dropped=0):
         body = body[-DIGEST_MAX_LINES:]
         lines.append(f"(앞부분 생략 — 최근 {DIGEST_MAX_LINES}줄만)")
     lines += body
-    lines.append(REPLY_HINT)
     text = "\n".join(lines)
-    if len(text.encode("utf-8")) > DIGEST_MAX_BYTES:
-        text = text.encode("utf-8")[:DIGEST_MAX_BYTES].decode("utf-8", "ignore") + "\n(생략)"
-    return text
+    hint_bytes = ("\n" + REPLY_HINT).encode("utf-8")
+    budget = max(DIGEST_MAX_BYTES - len(hint_bytes), 0)
+    text_bytes = text.encode("utf-8")
+    if len(text_bytes) > budget:
+        text = text_bytes[:budget].decode("utf-8", "ignore") + "\n(생략)"
+    return text + "\n" + REPLY_HINT
 
 
 def chain_count(active):
@@ -112,7 +125,10 @@ def stop_hook():
         payload = hook_payload()
         if os.environ.get("BCT_PANE_ID"):
             return                       # BCT pane — native push owns delivery
-        remark_session(payload)          # before the spawn: the daemon exits on an empty set
+        try:
+            remark_session(payload)      # before the spawn: the daemon exits on an empty set
+        except (Exception, SystemExit):
+            pass                         # a marker failure must not cost this turn's delivery
         ensure_daemon()                  # every hook is a spawn point
         active = bool(payload.get("stop_hook_active"))
         n = chain_count(active)
@@ -139,13 +155,18 @@ def prompt_submit_hook():
         payload = hook_payload()
         if os.environ.get("BCT_PANE_ID"):
             return
-        remark_session(payload)
+        try:
+            remark_session(payload)
+        except (Exception, SystemExit):
+            pass                         # a marker failure must not cost this turn's delivery
         ensure_daemon()
         recover_orphans()
+        forget(CHAIN)                    # a user prompt ends any automatic chain — even one
+                                          # that finds an empty inbox; the human engaging IS
+                                          # the reset, not the mention that happens to follow
         got = inbox_claim()
         if got is None:
             return
-        forget(CHAIN)                    # a user prompt ends any automatic chain
         print(compose_digest(got[1], take_dropped()))
         inbox_ack(got[0])
     except (Exception, SystemExit):
@@ -173,6 +194,8 @@ def session_end():
     """Drop this session's marker. The daemon is NOT killed — another claude session on this
     host may still be in the room; it exits on its own once the marker set empties."""
     try:
+        if os.environ.get("BCT_PANE_ID"):
+            return                       # BCT pane — every hook verb is a no-op there
         sid = hook_session_id(hook_payload())
         if sid:
             unmark_session(sid)

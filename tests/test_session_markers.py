@@ -263,6 +263,20 @@ class SessionMarkerTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.marker))
         self.assertFalse(os.path.exists(self.pidfile))
 
+    def test_a_bct_pane_session_end_is_a_noop(self):
+        """SPEC §5 claims every hook verb is a complete no-op inside a BCT pane —
+        session_end() must not touch a marker there either, even though BCT's native
+        push, not this hook, owns delivery for that pane."""
+        os.makedirs(os.path.dirname(self.marker), exist_ok=True)
+        open(self.marker, "w").close()
+        env = dict(os.environ, HOME=self.home, BCT_CHAT_HOME=self.state,
+                   BCT_PANE_ID="deadbeef", BCT_CHAT_SOCK="tcp:127.0.0.1:1")
+        r = subprocess.run([sys.executable, CLIENT, "session-end"], env=env,
+                           input=json.dumps({"session_id": "sess-abc"}),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(self.marker), "a BCT pane must not drop the marker")
+
 
 class ClaudePidTests(unittest.TestCase):
     """claude_pid() resolves the session's claude as the hook's GRANDPARENT (hooks.json's
