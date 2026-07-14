@@ -51,6 +51,18 @@ DROPPED = os.path.join(STATE_DIR, "dropped.json")
 INBOX_CAP = 50              # a deeper queue means nobody has been home for a long time
 ORPHAN_AGE = 120            # a processing/ item older than this belonged to a dead hook
 
+CHAIN = os.path.join(STATE_DIR, "chain.json")
+CHAIN_CAP = 3               # automatic re-engagements (stop_hook_active) before we stop
+                             # delivering: two standby remotes mentioning each other would
+                             # otherwise bill turns forever with no human in the loop
+STANDBY_HOLD = 900          # standby's LOCAL inbox wait — a directory poll, not a socket.
+                             # Bounded by hooks.json's Stop timeout (960s), which claude-code
+                             # honours as-is: the hook config schema caps nothing
+                             # (timeout: z.number().positive()) and the command spawn takes
+                             # `timeout * 1000` ms straight, with no clamp
+DIGEST_MAX_LINES = 200      # a backlog that rotted for hours must not dump 4000 lines
+DIGEST_MAX_BYTES = 16384     # into a turn — cap the lines AND the bytes
+
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 CLAUDE_COMM_RE = re.compile(r"claude|node", re.I)   # a hook ancestor plausible enough to
                                                      # trust as this session's claude — the

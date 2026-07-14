@@ -82,7 +82,7 @@ class SessionMarkerTests(unittest.TestCase):
         mod.rpc = lambda *a, **k: self.fail("SessionStart must not touch the socket")
         mod.sock_available = lambda: self.fail("SessionStart must not touch the socket")
         mod.subprocess = FakeSub
-        mod.hook_session_id = lambda: "sess-abc"
+        mod.hook_payload = lambda: {"session_id": "sess-abc"}
         mod.session_start()
         self.assertTrue(os.path.exists(self.marker))
         self.assertEqual(len(FakeSub.spawned), 1, "SessionStart did not ensure a daemon")
@@ -106,7 +106,7 @@ class SessionMarkerTests(unittest.TestCase):
 
         mod.mark_session = tracked_mark
         mod.ensure_daemon = lambda: order.append("spawn")
-        mod.hook_session_id = lambda: "sess-abc"
+        mod.hook_payload = lambda: {"session_id": "sess-abc"}
         mod.session_start()
         self.assertEqual(order, ["mark", "spawn"],
                          "mark_session()/ensure_daemon() call order regressed")

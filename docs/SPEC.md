@@ -35,6 +35,7 @@ All under `~/.bct-chat/` (override the whole directory with `$BCT_CHAT_HOME`):
 | `inbox/<time_ns>-<pid>.json` | a captured mention, not yet claimed by a hook |
 | `processing/<pid>-<time_ns>-<pid>.json` | a mention claimed by a hook, not yet acked |
 | `dropped.json` | `{"n"}` — mentions the inbox cap has thrown away, not yet reported |
+| `chain.json` | `{"n"}` — consecutive automatic re-engagements of the Stop hook (§5's chain cap) |
 
 Every write under this directory is atomic (temp file + `os.replace`, atomic on both
 POSIX and Windows): a hook killed mid-write can never leave a 0-byte `identity.json`
@@ -81,26 +82,66 @@ line of JSON out (`{"ok","text","error"}`).
 
 The four hook verbs are wired in `hooks/hooks.json`.
 
+- **Invariant: no hook verb opens a socket.** `session-start`, `session-end`,
+  `stop-hook` and `prompt-submit` perform zero RPC. Delivery is a local inbox read
+  (§6); capture is the daemon's job alone (§7). This is what makes "hook timeout <
+  RPC budget" *unrepresentable* rather than merely widened: the old `stop-hook` ran
+  `chat-peek` → `chat-read`, and `chat-read` advances BCT's server-side cursor with
+  no ack verb to replay it — so a hook killed after the cursor moved lost the
+  message outright. A hook that touches no socket can lose nothing, because the
+  cursor moved long before, in the daemon, and only after the message was already on
+  local disk.
 - **Invariant: a hook verb always exits 0.** `hooks.json` falls back from
   `python3` to `python` on ANY nonzero exit, and that re-run would see stdin
   already drained — no session id, no marker, no daemon. Every hook swallows
   `Exception` and `SystemExit` alike.
-- **Invariant: a hook is silent unless it has something to deliver.** A broken
-  tunnel must never disturb a turn.
-- Inside a BCT pane (`$BCT_PANE_ID` set) every hook verb is a no-op — BCT's
-  native chat injection owns delivery there.
-- `session-start`: keep the stable copy current, mark this session live, then
-  `ensure_daemon()`. It issues **no RPC at all**: joining the room and hearing it
-  are the daemon's job (§7). An interactive run (no session id on stdin) leaves no
-  marker and spawns nothing. The marker is written *before* the spawn — a daemon
-  that starts ahead of its own marker sees an empty session set and exits at once.
-- `session-end`: drop this session's marker. The daemon is not killed — another
-  session on this host may still be in the room; it exits on its own once the
-  marker set empties.
-- `stop-hook`: when the room has mentioned us, block the finishing turn with the
-  digest so claude answers the room in place.
-- `prompt-submit`: same detection, but the digest rides along as context with the
-  user's next prompt — this is what reaches a session that was idle.
+- **Invariant: a hook is silent unless it has something to deliver.**
+- **Invariant: no hook ever writes `dropped.json`.** It has exactly one writer —
+  the daemon's cap eviction (§6) — and a second one reintroduces a lost-update race.
+- Inside a BCT pane (`$BCT_PANE_ID` set) every hook verb is a complete no-op — it
+  claims nothing, spawns nothing. BCT's native chat injection owns delivery there.
+- Every hook is a **daemon spawn point** (`ensure_daemon()`), and every hook that
+  knows its session id **re-marks** it (`sessions/<id>`) before spawning. Re-marking
+  makes the marker self-healing: `claude_pid()` is a best-effort ancestor walk, and
+  if it ever resolved wrong, marker GC would collect a LIVE session's marker, the
+  daemon would exit, and that session would be deaf for good with nothing left to
+  repair it. It also refreshes the mtime that the pid-0 (Windows) `MARKER_TTL`
+  fallback rides on. Marker before spawn, always — a daemon that starts ahead of its
+  own marker sees an empty session set and exits at once.
+
+| Verb | Behaviour |
+|---|---|
+| `session-start` | keep the stable copy current, mark the session, `ensure_daemon()`. An interactive run (no session id on stdin) leaves no marker and spawns nothing. |
+| `session-end` | drop this session's marker. The daemon is not killed — another session on this host may still be in the room; it exits on its own once the marker set empties. |
+| `stop-hook` | claim one mention from the inbox and **block** the finishing turn with the digest, so claude answers the room in place. |
+| `prompt-submit` | claim one mention and print the digest as **context** alongside the user's prompt — this is what reaches a session that was never woken. Never holds. |
+
+**Modes** — `$BCT_CHAT_MODE`, read by `stop-hook` only:
+
+| Mode | Empty inbox at turn end | Cost |
+|---|---|---|
+| `work` (default) | return immediately | ~0 s and 0 tokens per turn |
+| `standby` | wait locally on the inbox for up to `STANDBY_HOLD` (900 s) | 0 tokens, 0 RPC — a directory poll, not a socket |
+
+A working session pays nothing per turn; only an idle session that opted into
+`standby` waits, and it waits on the local filesystem. `BCT_CHAT_STANDBY` survives as
+a legacy disable value. `hooks.json` gives `Stop` a 960 s timeout to cover the
+900 s hold with slack; the other three hooks do no RPC and never hold, so 10 s is
+generous. (Claude Code honours a hook `timeout` as written — its config schema
+imposes no maximum and the command spawn uses the value directly — but it does clamp
+its *`SessionEnd` shutdown wait* to 60 s, so `SessionEnd` must stay well under that.)
+
+**Chain cap.** `stop_hook_active` in the Stop payload means the turn is only
+continuing because *we* blocked it. `chain.json` counts those automatic
+re-engagements; at `CHAIN_CAP` (3) the hook stops delivering **and** stops holding,
+and the mention **stays in the inbox** for the user's next prompt. Two standby
+remotes mentioning each other must not bill turns forever with no human in the loop.
+Any user-driven turn resets the chain: `prompt-submit` clears the counter, and a Stop
+with `stop_hook_active` false reads the count as 0 regardless of the file.
+
+Delivery is **at-least-once** (§6): a hook that dies between claim and print leaves
+its item in `processing/`, and the orphan sweep — run by every hook and by the daemon
+— returns it to the inbox. A mention is never dropped without being delivered.
 
 ## 6. Inbox
 
@@ -300,6 +341,12 @@ The digest mirrors BCT's local chat injection: an identity line
 (`[bct-chat] 단체 채팅방 — 당신은 @<name> 입니다. 새 메시지:`), the room lines exactly
 as BCT returned them, then `REPLY_HINT` — the instruction telling claude to answer
 with `python3 ~/.bct-chat/bct-chat.py send "<답변>"`.
+
+It is capped: `DIGEST_MAX_LINES` (200) keeps only the most recent lines, and
+`DIGEST_MAX_BYTES` (16 KB) bounds the whole thing — a backlog that rotted for hours
+must not dump 4000 lines into a turn. Anything the inbox cap threw away since the last
+digest is announced first, as `(오래된 멘션 N건 생략)`. `stop-hook` emits the digest as
+`{"decision": "block", "reason": …}`; `prompt-submit` prints it plain.
 
 ## 10. Platforms
 
