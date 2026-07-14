@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""A denied/expired join request must not nag the dock: no automatic re-request
-for 30 min. A human typing `join` at the remote's shell always wins."""
+"""A join request that failed must not nag the dock with automatic re-requests for
+30 min. A DENIED request is respected even across a session restart (an explicit
+"no"); an EXPIRED one is dropped on a genuine session (re)start (it timed out or was
+lost to churn — fresh intent should re-request). A human typing `join` always wins."""
 import json
 import os
 import shutil
@@ -35,9 +37,9 @@ class CooldownTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
 
-    def write_cooldown(self, ago):
+    def write_cooldown(self, ago, outcome="expired"):
         with open(self.cooldown, "w", encoding="utf-8") as f:
-            json.dump({"lastFailedAt": time.time() - ago, "outcome": "expired"}, f)
+            json.dump({"lastFailedAt": time.time() - ago, "outcome": outcome}, f)
 
     def cmds(self, srv):
         return [r["cmd"] for r in srv.received]
@@ -58,14 +60,31 @@ class CooldownTests(unittest.TestCase):
         finally:
             srv.close()
 
-    def test_session_start_within_cooldown_does_not_request(self):
-        self.write_cooldown(ago=60)                            # 1 min ago: still cooling
+    def test_session_start_within_denied_cooldown_does_not_request(self):
+        # A DENIED request is an explicit "no": its cooldown is respected even on a
+        # session restart, so no fresh banner nags the user who just said no.
+        self.write_cooldown(ago=60, outcome="denied")         # 1 min ago: still cooling
         srv = FakeChatServer(lambda req: {"ok": True, "text": "REQ-2"})
         try:
             r = run(["session-start"], self.home, f"tcp:127.0.0.1:{srv.port}")
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn("chat-join", self.cmds(srv))
             self.assertFalse(os.path.exists(self.pending))
+            self.assertTrue(os.path.exists(self.cooldown))    # denied cooldown left intact
+        finally:
+            srv.close()
+
+    def test_session_start_within_expired_cooldown_rerequests(self):
+        # An EXPIRED request is not an explicit "no" — it timed out, or was lost to a BCT
+        # restart during churn. A genuine session (re)start is fresh intent, so session-start
+        # drops that cooldown and re-requests instead of silently sitting out its 30 min.
+        self.write_cooldown(ago=60, outcome="expired")        # still within the 30-min window
+        srv = FakeChatServer(lambda req: {"ok": True, "text": "REQ-EXP"})
+        try:
+            r = run(["session-start"], self.home, f"tcp:127.0.0.1:{srv.port}")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("chat-join", self.cmds(srv))         # cooldown cleared -> re-requested
+            self.assertFalse(os.path.exists(self.cooldown))    # the expired cooldown was dropped
         finally:
             srv.close()
 

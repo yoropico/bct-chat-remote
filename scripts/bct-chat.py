@@ -387,6 +387,13 @@ def session_start():
             return                  # no ssh session forwarding the socket
         if sid:
             mark_session(sid)       # before spawning: the daemon exits on an empty set
+        # A genuine session (re)start is fresh intent: if the standing cooldown was armed
+        # by a mere EXPIRY (an ignored request, or one lost to a BCT restart during churn),
+        # drop it so the restart re-requests instead of silently sitting out its 30 min. An
+        # explicit DENIAL is respected — never cleared here, so a restart cannot re-nag.
+        _cd = load(COOLDOWN)
+        if _cd and _cd.get("outcome") == "expired":
+            clear_cooldown()
         try:
             if load(PENDING):
                 claim_pending()

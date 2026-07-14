@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.1
+
+- Reliable session-restart rejoin: SessionStart now drops a standing join cooldown that was armed by an EXPIRY (a timed-out/ignored request, or one lost to a BCT restart during churn), so a genuine session restart re-requests instead of silently sitting out its 30 min. An explicit DENIAL is still respected — no re-nag.
+
+
 One entry per version, newest first, written in the SAME commit as the
 version bump. Mechanically enforced: the devmode pre-commit gate blocks a
 `plugin.json` "version" change that does not stage this file.
