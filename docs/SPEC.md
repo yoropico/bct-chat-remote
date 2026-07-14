@@ -75,8 +75,8 @@ meant the 300 s default, and `heartbeat --interval -1` reached `time.sleep(-1)`.
 |---|---|
 | `join [name]` | request a seat; blocks up to 5 min for the user's approval in BCT's chat dock. Manual intent overrides any cooldown. |
 | `leave` | leave the room and drop the identity |
-| `send <msg>` | post to the room |
-| `read` | drain the local inbox (§6) first, oldest first, then `chat-read` for anything newer than the daemon has captured. Never touches the socket first — the daemon may already hold what the user is asking for. |
+| `send <msg>` | post to the room. `<msg>` is required — a bare `send` dies with `send needs "<message>"` rather than argparse's generic "required" error. |
+| `read` | drain the local inbox (§6) first, oldest first, then `chat-read` for anything newer than the daemon has captured. Never touches the socket first — the daemon may already hold what the user is asking for. Each drained item is printed, THEN acked, one at a time — never claim-and-ack the whole backlog before printing any of it, or a crash mid-drain (Ctrl-C, SIGKILL, a wrapper timeout) silently deletes an item the user never saw. A crash between claim and print leaves the item in `processing/`, where the orphan sweep (§6) returns it to the inbox. |
 | `list` | the roster |
 | `wait [--timeout N]` | wait on the local inbox (§6), **not** `chat-read` — the daemon (§7) owns the socket now, and a second `chat-read` poller here would consume the cursor out from under it. On timeout, exits nonzero with a message. |
 | `listen [--timeout N]` | the same inbox wait as `wait`, but silent and exit-0 on an empty window — a single server-push-shaped turn. |

@@ -1188,21 +1188,19 @@ def positive(v):
     return f
 
 
-def drain_inbox():
-    """Everything the daemon captured, oldest first. The user's `read` must show it, or the
-    verbs appear to have lost the very messages the daemon just saved."""
-    out = []
+def do_read():
+    """Drain everything the daemon captured, oldest first, THEN chat-read for anything
+    newer. Print, THEN ack — one item at a time. A crash mid-drain (Ctrl-C, SIGKILL, a
+    wrapper timeout) must leave the not-yet-printed item in processing/, where
+    recover_orphans() returns it to the inbox: at-least-once (a rare duplicate) beats
+    a silent loss. Claiming the whole run and acking as it goes (the reverse order)
+    would delete items the user never saw."""
     while True:
         got = inbox_claim()
         if not got:
-            return out
-        out.append(got[1].get("text") or "")
+            break
+        print(got[1].get("text") or "")
         inbox_ack(got[0])
-
-
-def do_read():
-    for text in drain_inbox():
-        print(text)
     r = authed("chat-read", [])
     if not r.get("ok"):
         die(r.get("error", "error"))
@@ -1234,7 +1232,7 @@ def build_parser():
     sub = p.add_subparsers(dest="verb", required=True)
     j = sub.add_parser("join"); j.add_argument("name", nargs="*")
     sub.add_parser("leave")
-    s = sub.add_parser("send"); s.add_argument("message", nargs="+")
+    s = sub.add_parser("send"); s.add_argument("message", nargs="*")
     sub.add_parser("read")
     sub.add_parser("list")
     for v in ("wait", "listen"):
@@ -1268,6 +1266,9 @@ def main(argv):
     elif v == "leave":
         do_leave()
     elif v == "send":
+        if not a.message:
+            die('send needs "<message>"')     # argparse's generic "required: message" is
+                                               # useless at a remote shell; say what to type
         r = authed("chat-send", [" ".join(a.message)])
         if not r.get("ok"):
             die(r.get("error", "error"))
