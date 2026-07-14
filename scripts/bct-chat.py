@@ -718,14 +718,22 @@ def do_join(name, wait_approval=True):
     deadline = time.time() + 300
     while time.time() < deadline:
         time.sleep(2)
-        claim_pending()
-        if identity():
-            # Success is "we have an identity", NOT "PENDING vanished": the daemon polls
-            # too and may legitimately have claimed the approval out from under us.
-            print("입장 승인됨", file=sys.stderr)
+        if claim_pending():
+            print("입장 승인됨", file=sys.stderr)     # WE claimed the approval
             return
         if not load(PENDING):
-            die("denied or expired")
+            # The request is gone but we did not claim it. Two very different things look
+            # like this, and only the budget can tell them apart: the daemon polls the same
+            # request and may legitimately have claimed the approval out from under us
+            # (which clears the budget), or the request was denied/expired (which records
+            # the outcome). Never decide this on "do we have an identity" — a host whose
+            # stored identity has merely gone stale still HAS one, and it would report a
+            # join the user has not even looked at yet as approved. Nor on "did the identity
+            # change": BCT's reseat deliberately hands back the SAME participantID.
+            if join_state()["lastOutcome"] in ("denied", "expired"):
+                die("denied or expired")
+            print("입장 승인됨", file=sys.stderr)     # the daemon claimed it first
+            return
     die("승인 대기 시간 초과")
 
 

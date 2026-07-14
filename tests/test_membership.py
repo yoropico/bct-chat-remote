@@ -15,6 +15,24 @@ IDENT = "C1A6063F-0124-4229-9CE3-D757348A70F2"
 NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 
 
+class FastClock:
+    """A `time` stand-in whose sleeps really pass: do_join()'s 5-minute wait must be able to
+    reach its deadline in a test without the test taking 5 minutes. A CONSTANT clock would
+    hang the loop forever, which is the trap this class exists to avoid."""
+
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(seconds, 1.0)
+
+    def time_ns(self):
+        return int(self.now * 1e9)
+
+
 class MembershipTests(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
@@ -92,6 +110,38 @@ class MembershipTests(unittest.TestCase):
         self.mod.clear_join_state()                 # what the `join` verb does first
         self.mod.do_join("svr", wait_approval=False)
         self.assertEqual(self.mod.load(self.mod.PENDING)["requestID"], "REQ-9")
+
+    def test_a_stale_identity_is_not_mistaken_for_an_approval(self):
+        # Found live on a Windows remote whose identity had gone stale across a BCT restart.
+        # do_join() decided success by "do we have an identity", and the stale one satisfied
+        # that on the first poll — so it announced 입장 승인됨 for a request the user had not
+        # even looked at yet, and every verb afterwards kept failing with NOT_INVITED.
+        # "Did the identity CHANGE" would not have caught it either: BCT's reseat deliberately
+        # hands back the SAME participantID (that is how it preserves the unread cursor).
+        self.mod.save(self.mod.IDENTITY, {"participantID": "STALE", "name": "svr"})
+        self.rpc_map({"chat-join": {"ok": True, "text": "REQ-1"},
+                      "chat-join-poll": {"ok": False, "error": "pending"}})
+        self.mod.time = FastClock()                  # the 5-minute wait, without the wait
+        with self.assertRaises(SystemExit):          # times out waiting, never claims success
+            self.mod.do_join("svr", wait_approval=True)
+        self.assertEqual(self.mod.identity(), "STALE")   # untouched — we never seated
+
+    def test_an_approval_the_daemon_claimed_first_is_still_a_success(self):
+        # The other side of the same coin: the daemon polls the same request. If it claims the
+        # approval first, PENDING is gone and the budget is clear — that is success, not a
+        # denial, and do_join() must not report "denied or expired".
+        self.mod.save(self.mod.PENDING, {"requestID": "REQ-1", "name": "svr",
+                                         "requestedAt": time.time()})
+
+        def poll(args):
+            self.mod.forget(self.mod.PENDING)                       # the daemon got there first
+            self.mod.save(self.mod.IDENTITY, {"participantID": IDENT, "name": "svr"})
+            return {"ok": False, "error": "unknown request"}
+
+        self.rpc_map({"chat-join": {"ok": True, "text": "REQ-1"}, "chat-join-poll": poll})
+        self.mod.time = FastClock()
+        self.mod.do_join("svr", wait_approval=True)                 # must not raise
+        self.assertEqual(self.mod.identity(), IDENT)
 
     def test_authed_re_joins_once_on_not_invited(self):
         self.mod.save(self.mod.IDENTITY, {"participantID": "DEAD", "name": "svr"})
