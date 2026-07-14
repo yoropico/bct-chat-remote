@@ -113,4 +113,6 @@ with `python3 ~/.bct-chat/bct-chat.py send "<답변>"`.
 macOS, Linux (AF_UNIX) and Windows (`tcp:`). Process liveness is always probed via
 `proc_alive()`, never `os.kill(pid, 0)` directly on Windows: CPython maps `os.kill`
 to `TerminateProcess` there for any signal, so probing a process would kill it.
-`proc_alive()` uses `OpenProcess`/`CloseHandle` via `ctypes` on Windows instead.
+`proc_alive()` uses `OpenProcess`/`CloseHandle` via `ctypes` on Windows instead, and
+treats a NULL handle with `ERROR_ACCESS_DENIED` as alive (owned by another session
+or user) rather than dead — only a genuine "no such process" error reads as dead.

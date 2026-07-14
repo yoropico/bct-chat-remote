@@ -51,8 +51,7 @@ def do_heartbeat(interval, max_uptime):
         return                      # another daemon has it
     me = os.getpid()
     os.makedirs(STATE_DIR, exist_ok=True)
-    with open(PIDFILE, "w", encoding="utf-8") as f:
-        f.write(str(me))
+    atomic_write(PIDFILE, str(me))
     started = time.time()
     fails = 0
     try:

@@ -26,7 +26,6 @@ def atomic_write(path, text):
 
 
 def save(path, obj):
-    os.makedirs(STATE_DIR, exist_ok=True)
     atomic_write(path, json.dumps(obj, ensure_ascii=False))
 
 
@@ -47,12 +46,26 @@ def proc_alive(pid):
         # fall through to the POSIX branch below, which would reach os.kill.
         try:
             import ctypes
+            from ctypes import wintypes
             SYNCHRONIZE = 0x00100000
-            h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
-            if not h:
-                return False
-            ctypes.windll.kernel32.CloseHandle(h)
-            return True
+            ERROR_ACCESS_DENIED = 5   # NULL handle + this code: alive, owned by someone else
+            # use_last_error=True so ctypes.get_last_error() below reflects THIS call's
+            # GetLastError(), not a stale/unrelated one — ctypes.windll skips that tracking.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            # ctypes defaults restype to a 32-bit c_int; HANDLE is pointer-sized on Win64,
+            # so an untyped call truncates/misreads the return value there.
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            h = kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+            if h:
+                kernel32.CloseHandle(h)
+                return True
+            # NULL handle: ACCESS_DENIED means the process exists but is owned by a
+            # different session/user — alive, not gone. Any other error (e.g.
+            # ERROR_INVALID_PARAMETER, 87) means no such process.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
         except (AttributeError, ImportError, OSError):
             return False
     try:

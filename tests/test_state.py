@@ -62,6 +62,57 @@ class StateTests(unittest.TestCase):
                 os.kill = real_kill
         self.assertEqual(killed, [], "proc_alive called os.kill under os.name='nt'")
 
+    def test_proc_alive_windows_access_denied_means_alive(self):
+        # A live process owned by another Windows session/user makes OpenProcess
+        # return a NULL handle with GetLastError() == ERROR_ACCESS_DENIED (5) — that
+        # process EXISTS. proc_alive() must not read this as "dead".
+        self.assertTrue(self._proc_alive_with_fake_windows_api(last_error=5))
+
+    def test_proc_alive_windows_invalid_parameter_means_dead(self):
+        # ERROR_INVALID_PARAMETER (87): no process with this pid — genuinely dead.
+        self.assertFalse(self._proc_alive_with_fake_windows_api(last_error=87))
+
+    def _proc_alive_with_fake_windows_api(self, last_error):
+        import ctypes
+
+        class FakeFunc:
+            """Stands in for a ctypes function pointer: accepts restype/argtypes
+            assignment like the real thing, and always returns a NULL handle."""
+            def __init__(self):
+                self.restype = None
+                self.argtypes = None
+
+            def __call__(self, *args):
+                return 0
+
+        class FakeKernel32:
+            def __init__(self):
+                self.OpenProcess = FakeFunc()
+                self.CloseHandle = FakeFunc()
+
+        fake_kernel32 = FakeKernel32()
+        real_name = os.name
+        had_windll = hasattr(ctypes, "WinDLL")
+        real_windll = getattr(ctypes, "WinDLL", None)
+        had_gle = hasattr(ctypes, "get_last_error")
+        real_gle = getattr(ctypes, "get_last_error", None)
+
+        os.name = "nt"
+        ctypes.WinDLL = lambda name, use_last_error=True: fake_kernel32
+        ctypes.get_last_error = lambda: last_error
+        try:
+            return self.mod.proc_alive(12345)
+        finally:
+            os.name = real_name
+            if had_windll:
+                ctypes.WinDLL = real_windll
+            else:
+                del ctypes.WinDLL
+            if had_gle:
+                ctypes.get_last_error = real_gle
+            else:
+                del ctypes.get_last_error
+
 
 if __name__ == "__main__":
     unittest.main()
