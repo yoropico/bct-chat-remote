@@ -41,8 +41,20 @@ or a truncated stable copy.
 
 `$BCT_CHAT_SOCK` (default `~/.bct-chat.sock`, the ssh-`RemoteForward`ed BCT
 control socket). `tcp:<host>:<port>` selects TCP — the supported transport on
-Windows, where CPython has no AF_UNIX. Wire: one line of JSON in
-(`{"paneID","cmd","args"}`), one line of JSON out (`{"ok","text","error"}`).
+Windows, where CPython has no AF_UNIX; IPv6 hosts are bracketed
+(`tcp:[::1]:9000`). Wire: one line of JSON in (`{"paneID","cmd","args"}`), one
+line of JSON out (`{"ok","text","error"}`).
+
+- `sock_available()` decides availability by **connecting**, never by checking
+  that a unix socket path exists on disk — a stale socket file left by an ssh
+  reconnect without `StreamLocalBindUnlink` still exists but nothing is
+  listening, and a plain existence check would read that as healthy.
+- `rpc()` is bounded by one **overall deadline** covering the whole call, not a
+  per-`recv` timeout that a bridge dribbling bytes (e.g. a keepalive) could keep
+  resetting forever. Blank lines are keepalives and are skipped; if a read
+  coalesces two JSON frames, `rpc()` answers from the first and discards the
+  rest. A bridge that accepts the connection and closes it without replying is
+  reported as a socket error, not a malformed response.
 
 ## 4. Verbs
 
