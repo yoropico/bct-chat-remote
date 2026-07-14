@@ -171,11 +171,19 @@ One daemon per host. It exists because BCT prunes an external participant after
   automatic caller (the SessionStart hook, the presence daemon, `authed()`'s
   reactive re-join) goes through it, so a second `chat-join` can never fire
   while one is already outstanding: an outstanding `pending-join.json` is
-  always polled (`chat-join-poll`), never re-requested.
+  always polled (`chat-join-poll`), never re-requested. `ensure_membership()`
+  normally trusts a truthy `identity()` and returns early without touching the
+  wire; `force=True` skips that fast path for a caller that already has fresh
+  wire evidence the stored identity is dead, not merely absent — the presence
+  daemon's own `NOT_INVITED` tick is that caller, and it is the only one.
 - `pending-join.json` retires on its own once older than `PENDING_TTL` (10
   min) — not only on an `approved`/`denied`/`expired` reply. A reply the
   client doesn't recognize (e.g. BCT restarted and forgot the request id) must
-  not wedge the file forever and make the rejoin branch unreachable.
+  not wedge the file forever and make the rejoin branch unreachable. A
+  `pending-join.json` with no `requestedAt` (written before this field
+  existed) is backfilled as just-requested rather than read as ~55 years old
+  and discarded — which would fire a fresh `chat-join` and orphan an approval
+  already in flight.
 - The **join budget** (`join-state.json`) replaces the old flat 30-minute
   cooldown. A `denied`/`expired` outcome backs off `60s → 300s → 1800s`
   (`JOIN_BACKOFF`); after `JOIN_MAX_ATTEMPTS` (3) such outcomes the budget is

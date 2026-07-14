@@ -15,13 +15,20 @@ def identity():
 
 
 def join_state():
+    zero = {"attempts": 0, "nextAttemptAt": 0, "suspended": False, "lastOutcome": ""}
     obj = load(JOIN_STATE)
     if not isinstance(obj, dict):
-        return {"attempts": 0, "nextAttemptAt": 0, "suspended": False, "lastOutcome": ""}
-    return {"attempts": int(obj.get("attempts", 0)),
-            "nextAttemptAt": float(obj.get("nextAttemptAt", 0)),
-            "suspended": bool(obj.get("suspended", False)),
-            "lastOutcome": str(obj.get("lastOutcome", ""))}
+        return zero
+    try:
+        return {"attempts": int(obj.get("attempts", 0)),
+                "nextAttemptAt": float(obj.get("nextAttemptAt", 0)),
+                "suspended": bool(obj.get("suspended", False)),
+                "lastOutcome": str(obj.get("lastOutcome", ""))}
+    except (TypeError, ValueError):
+        # Called from the daemon's tick via may_request_join(); an exception here
+        # costs a failed tick, so a malformed field (e.g. {"attempts": "x"}) must
+        # read as no-budget-recorded-yet, not blow up the caller.
+        return zero
 
 
 def clear_join_state():
@@ -54,10 +61,21 @@ def pending():
     """The outstanding request, or None. A TTL — not the poll's reply — is what
     ultimately retires it: an unrecognized error (BCT restarted and forgot the id)
     used to wedge the file forever, and every auto-join caller prefers PENDING over
-    requesting, so the rejoin branch became unreachable (D6)."""
+    requesting, so the rejoin branch became unreachable (D6).
+
+    A pending-join.json written before this budget existed has no requestedAt.
+    Reading that absence as `0` would make the request read ~55 years old and
+    get discarded on sight — on the upgrade tick that throws away a legitimately
+    outstanding request and fires a fresh chat-join, orphaning an approval the
+    user may be looking at right now (the exact defect this budget exists to
+    kill). Backfill instead: treat a missing requestedAt as "just requested"."""
     obj = load(PENDING)
     if not isinstance(obj, dict) or "requestID" not in obj:
         return None
+    if "requestedAt" not in obj:
+        obj["requestedAt"] = time.time()
+        save(PENDING, obj)
+        return obj
     if time.time() - float(obj.get("requestedAt", 0)) > PENDING_TTL:
         forget(PENDING)
         return None
@@ -80,10 +98,15 @@ def claim_pending():
     return False
 
 
-def ensure_membership(wait_approval=False):
+def ensure_membership(wait_approval=False, force=False):
     """The ONLY automatic path into the room. Returns True if we are seated or a request
-    is now outstanding."""
-    if identity() and not wait_approval:
+    is now outstanding.
+
+    `force=True` skips the identity()-truthy fast path below. It exists for a caller
+    that already has fresh wire evidence the stored identity is dead — not merely
+    absent — and must not let a truthy-but-stale identity.json short-circuit a rejoin
+    (the presence daemon's NOT_INVITED tick is the only such caller)."""
+    if identity() and not wait_approval and not force:
         return True
     if pending():
         return claim_pending() or True        # a request is in flight: poll it, never re-ask
@@ -138,9 +161,11 @@ def authed(cmd, args, timeout=10):
 def do_leave():
     """Leaving must STAY left. The old leave dropped the identity and walked away, so the
     daemon re-requested membership four minutes later. Suspending the budget is what makes
-    the daemon stand down (and ensure_daemon() refuse to respawn it) — while the session
-    markers survive, because they describe which claude sessions are alive, and that is
-    still true after leaving the room."""
+    it stick: session_start() will happily respawn the heartbeat daemon after a leave
+    (spawn_heartbeat() has no suspension check, and there is no ensure_daemon() gate yet —
+    that's Task 6), but the respawned daemon finds may_request_join() False and never
+    re-requests — while the session markers survive, because they describe which claude
+    sessions are alive, and that is still true after leaving the room."""
     r = rpc("chat-leave", [], identity())
     forget(IDENTITY)
     forget(PENDING)

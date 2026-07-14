@@ -320,14 +320,12 @@ class HeartbeatTests(unittest.TestCase):
         finally:
             srv.close()
 
-    @unittest.skip("rewritten in Task 6: daemon-as-ear — join-cooldown.json is now "
-                    "join-state.json (Task 5's bounded budget); the daemon's own "
-                    "stop-nagging-after-denial behaviour is preserved (see "
-                    "test_membership.MembershipTests), only this test's file/shape "
-                    "assertions are stale.")
     def test_denied_pending_arms_cooldown_and_stops_join(self):
-        # A denied/expired poll must arm the 30-min cooldown, and subsequent
-        # ticks must send no further chat-join until it expires.
+        # A denied poll must arm the join budget's backoff, and subsequent ticks
+        # must send no further chat-join until it expires. This is the daemon's
+        # only coverage of the budget-gate branch (Task 5): it drives the real
+        # daemon process through ensure_membership(force=True), not the
+        # in-process ensure_membership() calls test_membership.py exercises.
         def handler(req):
             if req["cmd"] == "chat-join":
                 return {"ok": True, "text": "REQ-3"}
@@ -336,13 +334,17 @@ class HeartbeatTests(unittest.TestCase):
             return {"ok": False, "error": NOT_INVITED}
 
         srv = FakeChatServer(handler)
-        cooldown = os.path.join(self.state, "join-cooldown.json")
+        join_state = os.path.join(self.state, "join-state.json")
         try:
             self.proc = start_daemon(self.home, f"tcp:127.0.0.1:{srv.port}")
-            self.assertTrue(wait_for(lambda: os.path.exists(cooldown)))
-            with open(cooldown, encoding="utf-8") as f:
-                self.assertEqual(json.load(f)["outcome"], "denied")
-            time.sleep(0.6)     # a few more ticks; cooldown must hold
+            self.assertTrue(wait_for(lambda: os.path.exists(join_state)))
+            with open(join_state, encoding="utf-8") as f:
+                st = json.load(f)
+            self.assertEqual(st["attempts"], 1)
+            self.assertEqual(st["lastOutcome"], "denied")
+            self.assertGreater(st["nextAttemptAt"], time.time())
+            self.assertFalse(st["suspended"])
+            time.sleep(0.6)     # a few more ticks; the backoff must hold
             self.assertEqual(sum(1 for r in srv.received if r["cmd"] == "chat-join"), 1)
         finally:
             srv.close()

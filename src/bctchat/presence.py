@@ -72,20 +72,19 @@ def do_heartbeat(interval, max_uptime):
                 else:
                     r = rpc("chat-list", [], identity())    # read-only: its only job is touch()
                     if not r.get("ok") and r.get("error") == NOT_INVITED:
-                        # This tick already IS the fresh wire evidence ensure_membership()'s
-                        # identity()-truthy fast path would otherwise trust blindly (a dead
-                        # id kept on disk for its name) — so drive the same pending-first,
-                        # budget-gated sequence directly instead of going through it. Poll an
-                        # outstanding request first — never fire a fresh chat-join while one
-                        # is outstanding, or the new requestID orphans any approval already
-                        # in flight for the old one (D5). The budget itself is what makes a
+                        # This tick already IS the fresh wire evidence that a truthy
+                        # identity.json is dead on the wire, not merely absent —
+                        # ensure_membership()'s identity()-truthy fast path would
+                        # otherwise trust the file blindly and never re-join.
+                        # force=True skips that fast path while wait_approval stays
+                        # False, so the same pending-first, budget-gated sequence every
+                        # other automatic caller uses runs here too, without blocking
+                        # the tick loop. That single entry point is what makes a
                         # `leave` stick (D8) and a denied host stop nagging (D9): once
-                        # suspended, may_request_join() is False and this tick does nothing.
-                        if pending():
-                            claim_pending()
-                        elif may_request_join():
-                            obj = load_identity()
-                            do_join(obj["name"] if obj else default_name(), wait_approval=False)
+                        # suspended, may_request_join() is False and this tick does
+                        # nothing; and what stops a fresh chat-join from orphaning an
+                        # approval already in flight for an outstanding one (D5).
+                        ensure_membership(force=True)
                         fails = 0
                     elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
                         fails += 1
