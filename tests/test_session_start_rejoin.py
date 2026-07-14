@@ -87,6 +87,30 @@ class SessionStartRejoinTests(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_expired_cooldown_is_cleared_so_restart_rerequests(self):
+        # A prior request that merely EXPIRED (ignored, or lost to a BCT restart during
+        # churn) must not sideline a genuine session restart: session-start drops that
+        # cooldown and re-requests. (An explicit denial is respected — see the test above.)
+        def handler(req):
+            if req["cmd"] == "chat-join":
+                return {"ok": True, "text": "REQ-EXP"}
+            return {"ok": False, "error": NOT_INVITED}
+
+        self.write_identity()
+        cooldown = os.path.join(self.state, "join-cooldown.json")
+        with open(cooldown, "w", encoding="utf-8") as f:
+            json.dump({"lastFailedAt": time.time() - 60, "outcome": "expired"}, f)
+        srv = FakeChatServer(handler)
+        try:
+            r = run_session_start(self.home, f"tcp:127.0.0.1:{srv.port}")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("chat-join", self.cmds(srv))          # cooldown cleared -> re-requested
+            self.assertFalse(os.path.exists(cooldown))          # the expired cooldown was dropped
+            with open(self.pending, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["requestID"], "REQ-EXP")
+        finally:
+            srv.close()
+
     def test_live_identity_is_silent_noop(self):
         srv = FakeChatServer(lambda req: {"ok": True, "text": "roster"})
         try:
