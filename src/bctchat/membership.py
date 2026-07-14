@@ -10,8 +10,11 @@ def load_identity():
 
 
 def identity():
+    # Shape-check like its sibling loaders (join_state, pending): a truthy non-dict — an
+    # identity.json holding a JSON list — would reach .get() and raise AttributeError, and
+    # the daemon calls this outside its per-tick guard.
     obj = load_identity()
-    return obj.get("participantID", "") if obj else ""
+    return obj.get("participantID", "") if isinstance(obj, dict) else ""
 
 
 def join_state():
@@ -24,7 +27,7 @@ def join_state():
                 "nextAttemptAt": float(obj.get("nextAttemptAt", 0)),
                 "suspended": bool(obj.get("suspended", False)),
                 "lastOutcome": str(obj.get("lastOutcome", ""))}
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # json parses `Infinity`; int(inf) overflows
         # Called from the daemon's tick via may_request_join(); an exception here
         # costs a failed tick, so a malformed field (e.g. {"attempts": "x"}) must
         # read as no-budget-recorded-yet, not blow up the caller.
@@ -161,11 +164,11 @@ def authed(cmd, args, timeout=10):
 def do_leave():
     """Leaving must STAY left. The old leave dropped the identity and walked away, so the
     daemon re-requested membership four minutes later. Suspending the budget is what makes
-    it stick: session_start() will happily respawn the heartbeat daemon after a leave
-    (spawn_heartbeat() has no suspension check, and there is no ensure_daemon() gate yet —
-    that's Task 6), but the respawned daemon finds may_request_join() False and never
-    re-requests — while the session markers survive, because they describe which claude
-    sessions are alive, and that is still true after leaving the room."""
+    it stick: suspended-and-unseated is both ensure_daemon()'s refusal to spawn and the
+    running daemon's exit condition, and even a daemon that outlives them finds
+    may_request_join() False and never re-requests — while the session markers survive,
+    because they describe which claude sessions are alive, and that is still true after
+    leaving the room."""
     r = rpc("chat-leave", [], identity())
     forget(IDENTITY)
     forget(PENDING)

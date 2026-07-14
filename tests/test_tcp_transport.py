@@ -10,7 +10,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_heartbeat_helpers import reap_daemon, wait_for  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLIENT = os.path.join(REPO, "scripts", "bct-chat.py")
@@ -44,13 +48,20 @@ class FakeChatServer:
                         if not chunk:
                             break
                         buf += chunk
+                    if not buf.strip():
+                        continue                  # availability probe: connect+close
+                    req = json.loads(buf.decode())
+                    self.received.append(req)
+                    conn.sendall((json.dumps(self.handler(req)) + "\n").encode())
                 except OSError:
+                    # The recv() side already covered this; sendall() needs the same
+                    # guard. Windows resets the connection (WinError 10054,
+                    # ConnectionResetError — an OSError subclass) the instant a client
+                    # closes without draining the reply, and this is a daemon thread:
+                    # an uncaught exception here doesn't fail the run, but it does print
+                    # a traceback into otherwise-pristine test output. Either way the
+                    # peer is simply gone — nothing to fix, nothing to retry.
                     continue
-                if not buf.strip():
-                    continue                      # availability probe: connect+close
-                req = json.loads(buf.decode())
-                self.received.append(req)
-                conn.sendall((json.dumps(self.handler(req)) + "\n").encode())
 
     def close(self):
         self.sock.close()
@@ -111,20 +122,41 @@ class TcpTransportTests(unittest.TestCase):
         self.assertIn("socket error", r.stderr)
         self.assertNotIn("socket not found", r.stderr)
 
-    def test_session_start_tcp_reachable_requests_join(self):
+    def test_the_daemon_joins_over_tcp(self):
+        # The join is the DAEMON's job now, not SessionStart's — and this is the only test
+        # that drives it through a real detached spawn over the wire.
         srv = FakeChatServer(lambda req: {"ok": True, "text": "REQ-1"})
+        state = os.path.join(self.home, ".bct-chat")
+        os.makedirs(os.path.join(state, "sessions"))
+        with open(os.path.join(state, "sessions", "sess-1"), "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "startedAt": time.time()}, f)
+        pidfile = os.path.join(state, "heartbeat.pid")
+        proc = None
         try:
-            r = run_client(["session-start"], self.home, f"tcp:127.0.0.1:{srv.port}")
-            self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(srv.received[-1]["cmd"], "chat-join")
-            pending = os.path.join(self.home, ".bct-chat", "pending-join.json")
-            with open(pending) as f:
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("BCT_PANE_ID", "BCT_CHAT_SOCK")}
+            env.update(HOME=self.home, BCT_CHAT_HOME=state,
+                       BCT_CHAT_SOCK=f"tcp:127.0.0.1:{srv.port}")
+            proc = subprocess.Popen([sys.executable, CLIENT, "daemon"], env=env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            pending = os.path.join(state, "pending-join.json")
+            self.assertTrue(wait_for(lambda: os.path.exists(pending)),
+                            "the daemon never requested a seat over TCP")
+            self.assertIn("chat-join", [r["cmd"] for r in srv.received])
+            with open(pending, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["requestID"], "REQ-1")
         finally:
+            reap_daemon(pidfile)
+            if proc and proc.poll() is None:
+                proc.kill()
+            if proc:
+                proc.wait(timeout=5)
             srv.close()
 
     def test_session_start_tcp_unreachable_is_silent_noop(self):
-        # Pinned invariant: no listener -> exit 0, no join request left behind.
+        # Pinned invariant: no listener -> exit 0, no join request left behind. The hook
+        # touches no socket at all now, so there is nothing to leave behind either way.
         r = run_client(["session-start"], self.home, f"tcp:127.0.0.1:{free_port()}")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".bct-chat", "pending-join.json")))

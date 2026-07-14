@@ -13,7 +13,7 @@ Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
 import json, os, re, socket, subprocess, sys, time
 
-ARTIFACT = os.path.abspath(__file__)   # the concatenated single file; what spawn_heartbeat re-execs
+ARTIFACT = os.path.abspath(__file__)   # the concatenated single file; what ensure_daemon re-execs
 
 if hasattr(sys.stdout, "reconfigure"):
     # Wire and room text are UTF-8; never trust the locale (Korean Windows = cp949).
@@ -36,9 +36,16 @@ NO_NEW = "(새 메시지 없음)"
 NO_MENTION = "(새 멘션 없음)"          # chat-listen timeout sentinel (server push)
 NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
+MARKER_TTL = 7 * 86400          # a marker with no pid to probe (Windows) ages out this slowly:
+                                 # GC'ing a LIVE session's marker costs it its ear, while a
+                                 # leaked one only costs a phantom seat — so err long
 PIDFILE = os.path.join(STATE_DIR, "heartbeat.pid")
-HEARTBEAT_INTERVAL = 240        # 4 min — comfortably inside BCT's 10-min prune window
-HEARTBEAT_MAX_UPTIME = 43200    # 12 h — backstop for a marker leaked by a crashed session
+PIDFILE_STALE = 90              # pidfile mtime older than this = no daemon (with proc_alive)
+PRESENCE_INTERVAL = 240         # 4 min — comfortably inside BCT's 10-min prune window
+LISTEN_TIMEOUT = 40             # BCT holds chat-listen ~30s; 40 covers the hold plus slack
+BACKOFF_MIN = 60                # a dead tunnel is waited out, never died of
+BACKOFF_MAX = 300
+JOIN_POLL = 15                  # while unseated: how long between join/poll attempts
 
 STABLE = os.path.join(STATE_DIR, "bct-chat.py")
 
@@ -48,7 +55,23 @@ DROPPED = os.path.join(STATE_DIR, "dropped.json")
 INBOX_CAP = 50              # a deeper queue means nobody has been home for a long time
 ORPHAN_AGE = 120            # a processing/ item older than this belonged to a dead hook
 
+CHAIN = os.path.join(STATE_DIR, "chain.json")
+CHAIN_CAP = 3               # automatic re-engagements (stop_hook_active) before we stop
+                             # delivering: two standby remotes mentioning each other would
+                             # otherwise bill turns forever with no human in the loop
+STANDBY_HOLD = 900          # standby's LOCAL inbox wait — a directory poll, not a socket.
+                             # Bounded by hooks.json's Stop timeout (960s), which claude-code
+                             # honours as-is: the hook config schema caps nothing
+                             # (timeout: z.number().positive()) and the command spawn takes
+                             # `timeout * 1000` ms straight, with no clamp
+DIGEST_MAX_LINES = 200      # a backlog that rotted for hours must not dump 4000 lines
+DIGEST_MAX_BYTES = 16384     # into a turn — cap the lines AND the bytes
+
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+CLAUDE_COMM_RE = re.compile(r"claude|node", re.I)   # a hook ancestor plausible enough to
+                                                     # trust as this session's claude — the
+                                                     # CLI is a node program, and a marker
+                                                     # GC'd on a wrong pid costs an ear
 
 REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
               '(명단: `python3 ~/.bct-chat/bct-chat.py list`, 새 메시지 확인: '
@@ -201,10 +224,21 @@ def forget(path):
         pass
 
 
+PID_MAX = 2 ** 31 - 1           # pid_t is a signed 32-bit int; a DWORD on Windows
+
+
 def proc_alive(pid):
     """Is this pid a live process? NEVER os.kill(pid, 0) on Windows — CPython maps
-    os.kill to TerminateProcess there for ANY signal, i.e. probing would kill it."""
-    if not pid or pid <= 0:
+    os.kill to TerminateProcess there for ANY signal, i.e. probing would kill it.
+
+    The range check is load-bearing, not defensive tidiness: a pid past pid_t makes
+    os.kill raise OverflowError, and Windows' DWORD marshalling raise
+    ctypes.ArgumentError — NEITHER of which is an OSError, so neither except clause
+    below would catch it. The exception would then escape into gc_markers(), which
+    the daemon calls OUTSIDE its per-tick guard: one tampered marker file would kill
+    the daemon on every respawn, and the host would go permanently deaf while every
+    hook cheerfully swallowed the same error."""
+    if not pid or pid <= 0 or pid > PID_MAX:
         return False
     if os.name == "nt":
         # AttributeError/ImportError/OSError all mean "could not ask" here — never
@@ -268,9 +302,52 @@ def ensure_stable_copy():
         pass                        # best-effort; never block session start
 
 
+def ps_field(fmt, pid):
+    """One `ps -o <fmt> -p <pid>`, as a stripped string. "" for every failure — no ps on
+    this host, a timeout, or a pid that is already gone."""
+    try:
+        out = subprocess.run(["ps", "-o", fmt, "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3)
+    except Exception:
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def claude_pid():
+    """Best-effort pid of the claude process this hook belongs to. The hook's own parent
+    is the `sh -c` wrapper hooks.json needs for its `||` fallback, and that shell exits the
+    moment we do — so we look one further up. POSIX only: on Windows there is no cheap
+    ancestor walk, and 0 means 'no pid liveness for this marker' (gc_markers falls back to
+    MARKER_TTL there).
+
+    A wrong answer here is NOT symmetric, so this errs toward 0. Hand back a pid that is
+    not this session's claude and gc_markers() collects a LIVE session's marker the moment
+    that stranger exits: live_sessions() empties, the daemon exits, and nothing re-creates
+    the marker — that session is deaf for the rest of its life. Hand back 0 and the marker
+    merely ages out on MARKER_TTL (a phantom seat, nothing more).
+
+    "Still exists at the moment we ask" was never enough of a check on its own — a
+    short-lived wrapper is alive at that moment too. So the ancestor must ALSO look like
+    claude (claude/node) before we trust it; anything else is 0."""
+    if os.name == "nt":
+        return 0
+    try:
+        pid = int(ps_field("ppid=", os.getppid()))
+    except ValueError:
+        return 0                        # no ps, or no such process
+    if pid <= 1 or not proc_alive(pid):
+        return 0
+    lines = ps_field("comm=", pid).splitlines()      # a full path on macOS, argv[0] on Linux
+    comm = os.path.basename(lines[0].strip()) if lines else ""
+    return pid if CLAUDE_COMM_RE.search(comm) else 0
+
+
 def mark_session(sid):
+    """One marker per live claude session on this host — the daemon's refcount. The pid
+    lets a crashed session's marker be collected; the mtime (refreshed by every hook of
+    that session) is the fallback where no pid is available."""
     os.makedirs(SESSIONS_DIR, exist_ok=True)
-    open(os.path.join(SESSIONS_DIR, sid), "w").close()
+    save(os.path.join(SESSIONS_DIR, sid), {"pid": claude_pid(), "startedAt": time.time()})
 
 
 def unmark_session(sid):
@@ -278,9 +355,8 @@ def unmark_session(sid):
 
 
 def live_sessions():
-    """One marker per live claude session on this host — the daemon's refcount."""
     try:
-        return os.listdir(SESSIONS_DIR)
+        return sorted(os.listdir(SESSIONS_DIR))
     except OSError:
         return []
 
@@ -289,7 +365,16 @@ def live_sessions():
 """The local mention inbox: the durability boundary between the daemon's ear and the
 hooks' mouth. The daemon does not issue its next chat-listen until the item is here,
 so a message whose server-side cursor has advanced is always already on local disk."""
-import json, os, re, socket, subprocess, sys, time
+import itertools, json, os, re, socket, subprocess, sys, time
+
+_PUT_SEQ = itertools.count()   # tie-breaker for inbox_put()'s filename: time_ns() alone can
+                                # collide when several puts land in the same process within
+                                # one clock tick — observed in practice on Windows CI, whose
+                                # effective clock resolution under virtualization is coarser
+                                # than a tight Python loop's per-iteration cost. Two items
+                                # sharing a filename would silently clobber one another; the
+                                # counter guarantees every put() this process ever makes gets
+                                # a distinct, FIFO-ordered name regardless of clock ties.
 
 
 def _items(d):
@@ -365,7 +450,8 @@ def inbox_put(text, name):
                       if _evict(os.path.join(INBOX_DIR, n)))
         if dropped:
             _bump_dropped(dropped)
-    path = os.path.join(INBOX_DIR, f"{time.time_ns()}-{os.getpid()}.json")
+    path = os.path.join(INBOX_DIR,
+                        f"{time.time_ns():020d}-{os.getpid()}-{next(_PUT_SEQ):012d}.json")
     atomic_write(path, json.dumps({"text": text, "capturedAt": time.time(), "name": name},
                                   ensure_ascii=False))
     return path
@@ -402,7 +488,12 @@ def inbox_ack(path):
     forget(path)
 
 
-_SIDECAR_RE = re.compile(r"\.(\d+)\.(?:evict|claim|bump|tmp)$")
+_SIDECAR_RE = re.compile(r"\.(\d{1,10})\.(?:evict|claim|bump|tmp)$")
+# The digit bound keeps int() cheap; it is NOT what makes a hand-planted absurd pid
+# safe. It cannot be: the OverflowError boundary (2147483647) sits INSIDE any 10-digit
+# range, so a bounded regex still admits pids that would blow up os.kill(). The real
+# guard is proc_alive()'s explicit PID_MAX range check, which returns False for
+# anything outside pid_t instead of raising something no caller catches.
 
 
 def _sweep_sidecars(d, now):
@@ -426,9 +517,12 @@ def _sweep_sidecars(d, now):
     closes the race, not a staleness threshold.
 
     Once the owner is confirmed dead, ORPHAN_AGE is still checked as a second,
-    independent condition, so a pid number that has since been recycled by an
-    unrelated new process can't make an otherwise-fresh sidecar look sweepable the
-    moment its original owner is gone.
+    independent condition — not as a defense against pid recycling. Recycling can't
+    cause a WRONG delete: if the pid in a sidecar's name has since been reused by a
+    new, unrelated process, proc_alive() reads it as alive and the sidecar is skipped
+    regardless of mtime, which only DELAYS cleanup (the sidecar lingers until that
+    new process is also gone), never triggers an early one. ORPHAN_AGE is just an
+    extra staleness margin applied once the owner is already confirmed dead.
 
     .evict sidecars need no further guard beyond the pid check: _evict() never
     reads one back, so a sweep that beats its forget() just makes that forget() a
@@ -502,8 +596,11 @@ def load_identity():
 
 
 def identity():
+    # Shape-check like its sibling loaders (join_state, pending): a truthy non-dict — an
+    # identity.json holding a JSON list — would reach .get() and raise AttributeError, and
+    # the daemon calls this outside its per-tick guard.
     obj = load_identity()
-    return obj.get("participantID", "") if obj else ""
+    return obj.get("participantID", "") if isinstance(obj, dict) else ""
 
 
 def join_state():
@@ -516,7 +613,7 @@ def join_state():
                 "nextAttemptAt": float(obj.get("nextAttemptAt", 0)),
                 "suspended": bool(obj.get("suspended", False)),
                 "lastOutcome": str(obj.get("lastOutcome", ""))}
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # json parses `Infinity`; int(inf) overflows
         # Called from the daemon's tick via may_request_join(); an exception here
         # costs a failed tick, so a malformed field (e.g. {"attempts": "x"}) must
         # read as no-budget-recorded-yet, not blow up the caller.
@@ -653,11 +750,11 @@ def authed(cmd, args, timeout=10):
 def do_leave():
     """Leaving must STAY left. The old leave dropped the identity and walked away, so the
     daemon re-requested membership four minutes later. Suspending the budget is what makes
-    it stick: session_start() will happily respawn the heartbeat daemon after a leave
-    (spawn_heartbeat() has no suspension check, and there is no ensure_daemon() gate yet —
-    that's Task 6), but the respawned daemon finds may_request_join() False and never
-    re-requests — while the session markers survive, because they describe which claude
-    sessions are alive, and that is still true after leaving the room."""
+    it stick: suspended-and-unseated is both ensure_daemon()'s refusal to spawn and the
+    running daemon's exit condition, and even a daemon that outlives them finds
+    may_request_join() False and never re-requests — while the session markers survive,
+    because they describe which claude sessions are alive, and that is still true after
+    leaving the room."""
     r = rpc("chat-leave", [], identity())
     forget(IDENTITY)
     forget(PENDING)
@@ -670,33 +767,12 @@ def do_leave():
 
 
 # ---- presence ----------------------------------------------------------
-"""Heartbeat daemon: proves this host is alive while any claude session on it is."""
+"""Capture. One daemon per host holds chat-listen continuously and lands every mention in
+the inbox BEFORE issuing the next listen. It is the only thing in the system that talks to
+the room on its own, which is why its exit conditions are exactly three — no live session,
+a newer daemon, or a room the user has left — and why a dead tunnel is something it WAITS
+for rather than dies of."""
 import json, os, re, socket, subprocess, sys, time
-
-
-def heartbeat_alive():
-    """Is a daemon running? Its pid file's mtime is refreshed every tick, so a stale
-    file (crashed daemon) ages out. NEVER probe the pid with os.kill(pid, 0) — on
-    Windows that TERMINATES the process."""
-    try:
-        return time.time() - os.stat(PIDFILE).st_mtime < 2 * HEARTBEAT_INTERVAL
-    except OSError:
-        return False
-
-
-def spawn_heartbeat():
-    if heartbeat_alive():
-        return
-    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
-              "stderr": subprocess.DEVNULL}
-    if os.name == "nt":
-        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    try:
-        subprocess.Popen([sys.executable, ARTIFACT, "heartbeat"], **kwargs)
-    except OSError:
-        pass                        # best-effort; never block session start
 
 
 def pidfile_owner():
@@ -707,256 +783,433 @@ def pidfile_owner():
         return 0
 
 
-def do_heartbeat(interval, max_uptime):
-    """Prove this host is alive while any claude session on it is. BCT prunes an
-    external after 10 min of silence and (before the retire/reseat change) that
-    destroyed its unread cursor — so a live-but-quiet host must keep ticking.
+def heartbeat_alive():
+    """mtime AND a real liveness probe. mtime alone called a signal-killed daemon alive for
+    8 minutes (D2) — its pidfile keeps a fresh mtime, and nothing respawns a corpse that
+    still looks warm."""
+    try:
+        if time.time() - os.stat(PIDFILE).st_mtime >= PIDFILE_STALE:
+            return False
+    except OSError:
+        return False
+    return proc_alive(pidfile_owner())
 
-    The pid file is this daemon's only coordination primitive, so two rules are
-    load-bearing: (1) release it in `finally`, and only when we still own it — a
-    daemon that yields to a newer instance must never touch, let alone delete,
-    the winner's file; (2) a tick that dies (die()/SystemExit from a chained
-    do_join, or any other exception — e.g. save() hitting a full disk) must not
-    take the daemon down with it. Its whole job is to keep ticking, so a bad tick
-    is just a failed tick and the existing two-strike rule applies."""
+
+def ensure_daemon():
+    """Every hook is a spawn point (D1: SessionStart used to be the only one). Cheap: the
+    hooks do no RPC now, so they can afford this check on every turn."""
+    if heartbeat_alive():
+        return
+    if suspended() and not identity():
+        return                          # the user left / denied us out — do not resurrect
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen([sys.executable, ARTIFACT, "daemon"], **kwargs)
+    except OSError:
+        pass                            # best-effort; never block a hook
+
+
+def gc_markers():
+    """A crashed claude leaks its marker, and a leaked marker used to keep a phantom host
+    in the room for 12 hours (D12). Collect it by pid where we have one, by age where we
+    do not — erring long, because evicting a LIVE session's marker would cost it its ear.
+
+    Runs at the top of every loop pass, outside the tick's own try/except, so nothing in
+    here may raise: a marker with a non-integer pid (disk damage, or the empty marker a
+    pre-upgrade session left) reads as pid 0 — no liveness to probe — and ages out on the
+    TTL instead."""
+    n = 0
+    for sid in live_sessions():
+        p = os.path.join(SESSIONS_DIR, sid)
+        try:
+            pid = int((load(p) or {}).get("pid", 0) or 0)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            # OverflowError is not hypothetical: json parses a literal `Infinity` (and any
+            # 1e400-style overflow) to float inf, and int(inf) raises it. This function runs
+            # OUTSIDE the daemon's per-tick guard, so anything escaping here is a fourth exit
+            # condition — the docstring's "nothing in here may raise" has to be literally true.
+            pid = 0
+        try:
+            age = time.time() - os.stat(p).st_mtime
+        except OSError:
+            continue                    # vanished underneath us
+        dead = (not proc_alive(pid)) if pid > 0 else (age > MARKER_TTL)
+        if dead:
+            forget(p)
+            n += 1
+    return n
+
+
+def backoff_wait(backoff):
+    """Wait out a failed tick, then widen the window. A dead tunnel is something to wait
+    for, not to die of (D1: the old two-strike suicide cost a live session its ear over an
+    8-minute blip) — but waiting must never become busy-waiting.
+
+    The wait is CHUNKED, never one long sleep. The pidfile's mtime is the only evidence
+    this daemon is alive, and PIDFILE_STALE (90 s) is far shorter than BACKOFF_MAX (300 s):
+    a daemon that stops refreshing it while it waits out a dead tunnel — the exact scenario
+    this backoff exists for — reads as a corpse to heartbeat_alive(), so every hook's
+    ensure_daemon() spawns a rival (every hook is a spawn point) while the incumbent sleeps
+    on. It is alive the whole time and must keep saying so.
+
+    Re-checking live_sessions() between chunks is the other half: a daemon whose last
+    session ended mid-backoff gets out of the way now, not up to BACKOFF_MAX later."""
+    chunk = max(1.0, PIDFILE_STALE / 2.0)
+    left = backoff
+    while left > 0:
+        time.sleep(min(chunk, left))
+        left -= chunk
+        try:
+            os.utime(PIDFILE, None)
+        except OSError:
+            pass                        # vanished underneath us; the owner check catches it
+        if not live_sessions():
+            break                       # nobody left to wait for
+    return min(backoff * 2, BACKOFF_MAX)
+
+
+def do_daemon(presence_interval=None, listen_timeout=None):
+    """The ear. Exit conditions are exactly three; everything else is waited out."""
+    presence_interval = PRESENCE_INTERVAL if presence_interval is None else presence_interval
+    listen_timeout = LISTEN_TIMEOUT if listen_timeout is None else listen_timeout
     if heartbeat_alive() and pidfile_owner() != os.getpid():
-        return                      # another daemon has it
+        return                          # another daemon has it
     me = os.getpid()
-    os.makedirs(STATE_DIR, exist_ok=True)
     atomic_write(PIDFILE, str(me))
-    started = time.time()
-    fails = 0
+    backoff = BACKOFF_MIN
+    # Trust identity.json until the WIRE disagrees: a daemon restart with a valid seat must
+    # not re-probe (let alone re-request) its way back into a room it is already in.
+    seated = bool(identity())
+    dead_id = ""                        # the identity a NOT_INVITED reply has disproven
+    unlanded = None                     # a mention heard but not yet landed (inbox_put raised)
+    last_tick = time.time()
     try:
         while True:
+            gc_markers()
             if not live_sessions():
-                break               # every claude on this host is gone — get out of the way
-            if time.time() - started > max_uptime:
-                break               # leaked marker backstop
+                # Nobody left to hear for. Release the pidfile HERE rather than in the
+                # finally, then look again: a session that marks itself between the check
+                # and the release calls ensure_daemon(), sees heartbeat_alive() (we are
+                # still alive, our pidfile still fresh), declines to spawn — and would be
+                # left holding a marker with no ear. Releasing first makes us the loser of
+                # that race instead of it, and we simply hand the marker on.
+                if pidfile_owner() == me:
+                    forget(PIDFILE)
+                if live_sessions():
+                    ensure_daemon()     # a no-op if one is somehow already alive
+                return
             if pidfile_owner() not in (me, 0):
-                break               # a newer daemon took over — its file, not ours to touch
+                break                   # a newer daemon took over — its file, not ours to touch
+            if suspended() and not identity():
+                break                   # the user left the room
             try:
-                os.utime(PIDFILE, None)   # liveness for heartbeat_alive()
+                os.utime(PIDFILE, None)
             except OSError:
-                pass                # vanished underneath us; the owner check above will catch it
+                pass                    # vanished underneath us; the owner check catches it
             try:
+                if unlanded is not None:
+                    # A mention we heard but could not land (ENOSPC, EINTR). BCT's cursor
+                    # has ALREADY advanced past it and there is no ack verb to replay it,
+                    # so it is retried BEFORE anything else can move the cursor again: a
+                    # failed put costs a delay, never the message. A persistent failure
+                    # raises straight back into the backoff below — no hot spin.
+                    inbox_put(*unlanded)
+                    unlanded = None
+                recover_orphans()
                 if not sock_available():
-                    fails += 1
-                else:
-                    r = rpc("chat-list", [], identity())    # read-only: its only job is touch()
+                    backoff = backoff_wait(backoff)
+                    continue
+                if not seated:
+                    # force=True ONLY for the identity the wire has actually disproven.
+                    # ensure_membership()'s identity()-truthy fast path is right for every
+                    # other case, and forcing past it while holding a live seat would fire
+                    # a chat-join for a room we are already in. It stays the one automatic
+                    # join entry point either way: never a bare do_join(), so a second
+                    # request can never orphan an approval already in flight (D5), and a
+                    # spent budget (denied, or a `leave`) simply asks for nothing.
+                    if not ensure_membership(force=bool(dead_id) and identity() == dead_id):
+                        time.sleep(JOIN_POLL)      # budget spent — nothing left to ask
+                        continue
+                    # An identity is a reason to PROBE, never proof of a seat — and the
+                    # absence of one is the only thing that means "no seat yet". A
+                    # reseat legitimately hands back the SAME participantID (BCT retires
+                    # and re-seats an external participant deliberately, preserving its
+                    # identity AND its unread cursor across a prune), so gating on
+                    # `identity() == dead_id` here livelocked: the approval wrote that id
+                    # straight back, the gate stayed true forever, ensure_membership()
+                    # short-circuited on its identity fast path, and the daemon spun every
+                    # JOIN_POLL — alive, seated on the server, permanently deaf. The
+                    # chat-list below is the seat detector; if the wire says NOT_INVITED
+                    # again, dead_id is simply re-armed. Cost: one extra chat-list per
+                    # JOIN_POLL while an approval is pending.
+                    if not identity():
+                        time.sleep(JOIN_POLL)      # a request is in flight; no seat yet
+                        continue
+                    r = rpc("chat-list", [], identity())   # the wire, not the file, seats us
+                    last_tick = time.time()
+                    if not r.get("ok"):
+                        if r.get("error") == NOT_INVITED:
+                            dead_id = identity()   # still dead — keep force armed for it
+                        time.sleep(JOIN_POLL)
+                        continue
+                    dead_id = ""                   # cleared only by a seat the wire confirms
+                    seated = True
+                if time.time() - last_tick >= presence_interval:
+                    r = rpc("chat-list", [], identity())   # prune defence; read-only
+                    last_tick = time.time()
                     if not r.get("ok") and r.get("error") == NOT_INVITED:
-                        # This tick already IS the fresh wire evidence that a truthy
-                        # identity.json is dead on the wire, not merely absent —
-                        # ensure_membership()'s identity()-truthy fast path would
-                        # otherwise trust the file blindly and never re-join.
-                        # force=True skips that fast path while wait_approval stays
-                        # False, so the same pending-first, budget-gated sequence every
-                        # other automatic caller uses runs here too, without blocking
-                        # the tick loop. That single entry point is what makes a
-                        # `leave` stick (D8) and a denied host stop nagging (D9): once
-                        # suspended, may_request_join() is False and this tick does
-                        # nothing; and what stops a fresh chat-join from orphaning an
-                        # approval already in flight for an outstanding one (D5).
-                        ensure_membership(force=True)
-                        fails = 0
-                    elif not r.get("ok") and str(r.get("error", "")).startswith("socket"):
-                        fails += 1
-                    else:
-                        fails = 0
-                        claim_pending()  # an approval may have landed since the last tick
+                        seated, dead_id = False, identity()
+                        continue
+                started = time.time()
+                r = rpc("chat-listen", [], identity(), timeout=listen_timeout)
+                if not r.get("ok"):
+                    if r.get("error") == NOT_INVITED:
+                        seated, dead_id = False, identity()   # BCT restarted or evicted us
+                        continue
+                    backoff = backoff_wait(backoff)
+                    continue
+                backoff = BACKOFF_MIN
+                text = r.get("text") or ""
+                if text and text not in (NO_NEW, NO_MENTION):
+                    obj = load_identity() or {}
+                    unlanded = (text, obj.get("name", default_name()))
+                    inbox_put(*unlanded)        # BEFORE the next listen
+                    unlanded = None             # landed; nothing to retry
+                    continue                    # a busy room drains at full speed
+                # Silence. A push window is supposed to HOLD (~30s server-side); one that
+                # answers instantly is a bridge too old to hold it, and re-arming against
+                # that in a tight loop turns this daemon into a busy-wait on the user's
+                # remote. Floor the re-arm at a tenth of the window we asked for (≤1s).
+                # It costs a live room nothing: an unheard mention stays unread server-side
+                # until some listen collects it, so pausing here loses no message.
+                held, floor = time.time() - started, min(1.0, listen_timeout / 10.0)
+                if held < floor:
+                    time.sleep(floor - held)
             except (Exception, SystemExit):
-                # e.g. do_join -> die() on a chat-join error. A failed tick, nothing more —
-                # never let it kill the daemon outright.
-                fails += 1
-            if fails >= 2:
-                break               # tunnel is down; the next session start respawns us
-            time.sleep(interval)
+                # A bad tick is a failed tick, nothing more. The daemon's whole job is to
+                # keep listening; a die() out of a chained join, or a full disk, must never
+                # take the ear down with it.
+                backoff = backoff_wait(backoff)
     finally:
         if pidfile_owner() == me:
-            forget(PIDFILE)         # only ever release a pid file we still own
+            forget(PIDFILE)             # only ever release a pidfile we still own
 
 
 # ---- delivery ----------------------------------------------------------
-"""Hook entry points: SessionStart/SessionEnd/Stop/UserPromptSubmit digest delivery."""
+"""Delivery. LOCAL ONLY — no socket, no RPC, no exception. The hooks read an inbox the
+daemon fills; a hook that is killed can therefore lose nothing, because BCT's cursor moved
+long before, in the daemon, and only after the message was already on this disk.
+
+That is the whole point of this module. The old stop_hook() ran chat-peek -> chat-read, and
+chat-read advances BCT's server-side cursor with no ack verb to replay it: the Stop hook's
+timeout was smaller than that path's worst-case RPC budget, so a hook killed after the
+cursor moved lost the message outright. Not "rarely" — structurally. No hook opens a socket
+now, so "hook timeout < RPC budget" is not a thing that can happen here: it is
+unrepresentable, not merely widened."""
 import json, os, re, socket, subprocess, sys, time
 
+INBOX_POLL = 1.0
 
-def hook_session_id():
-    """claude-code pipes the hook payload as JSON on stdin. An interactive run has a
-    tty there — never block on it. The result is used directly as a filename under
-    sessions/, so it is never trusted as-is: any parse/shape failure — a malformed
-    payload, a non-object top-level value (a bare list/string/number/null all raise
-    AttributeError out of a naive `.get()`) — is treated the same as a missing
-    session_id, and the extracted value is then os.path.basename()'d and checked
-    against a strict charset before being handed back. A value that fails that check
-    (empty, ".", "..", or containing anything outside [A-Za-z0-9._-]) is treated as
-    absent ("") rather than raised — the caller never needs its own try/except
-    around this, and a traversal-shaped id can never reach a filesystem call."""
+
+def chat_mode():
+    """work (default): the Stop hook returns in milliseconds. standby: it waits on the
+    inbox locally for up to STANDBY_HOLD — zero tokens, zero RPC.
+
+    BCT_CHAT_MODE wins whenever it holds a recognized value. BCT_CHAT_STANDBY is the
+    legacy variable, and it means what it says: a truthy value (anything other than
+    the disable spellings below, or unset) turns standby ON. Treating every legacy
+    value as "work" — the bug this replaces — silently defeated any pre-existing
+    BCT_CHAT_STANDBY=1 the moment this code shipped."""
+    v = os.environ.get("BCT_CHAT_MODE", "").strip().lower()
+    if v in ("standby", "work"):
+        return v
+    legacy = os.environ.get("BCT_CHAT_STANDBY", "").strip().lower()
+    if legacy in ("0", "off", "false", "no", ""):
+        return "work"
+    return "standby"
+
+
+def hook_payload():
+    """claude-code pipes the hook payload as JSON on stdin. Read it ONCE (a second read
+    gets nothing), never block on a tty, and treat any malformed shape as an empty payload."""
     try:
         if sys.stdin is None or sys.stdin.isatty():
-            return ""
+            return {}
         obj = json.loads(sys.stdin.read() or "{}")
-        sid = str(obj.get("session_id", "")) if isinstance(obj, dict) else ""
+        return obj if isinstance(obj, dict) else {}
     except Exception:
-        return ""
-    sid = os.path.basename(sid)
+        return {}
+
+
+def hook_session_id(payload):
+    """The session id becomes a filename under sessions/, so it is never trusted as-is:
+    basename + a strict charset, and anything else is treated as absent."""
+    sid = os.path.basename(str(payload.get("session_id", "")))
     if sid in ("", ".", "..") or not SESSION_ID_RE.match(sid):
         return ""
     return sid
 
 
-def session_start():
-    """SessionStart hook: silent no-ops by design, but never silently absent — if we
-    have no seat yet (or one is already outstanding), press it forward through the join
-    budget, and keep a heartbeat running for as long as this host has a live claude
-    session. Detecting a *stale* identity (BCT restarted and forgot us while
-    identity.json still holds the old id) is the daemon's job, not this hook's — it
-    already probes on every tick and reacts on NOT_INVITED.
+def remark_session(payload):
+    """Re-assert this session's marker on every hook that knows its id.
 
-    Invariant: this verb must always exit 0. hooks.json falls back from python3 to
-    python on ANY nonzero exit (Windows lacks a reliable "is python3 the MS Store
-    stub" test), so a die() escaping here would re-run the whole hook with stdin
-    already drained — no session id, no marker, no daemon, and a duplicate chat-join
-    banner. So nothing past ensure_stable_copy() may escape as an exception or a
-    SystemExit — the same (Exception, SystemExit) idiom do_heartbeat() already uses
-    for its own tick loop, applied here to the whole rest of the hook (mark_session()
-    included: a malformed session id could in principle still slip past
-    hook_session_id()'s own sanitizing, and this is the backstop for that). A join
-    failure specifically must still let spawn_heartbeat() run afterwards — a marker
-    with no daemon is a worse regression than either symptom alone — so that inner
-    step keeps its own narrower try immediately around the join call. The user-facing
-    verbs (send/read/wait/list/join/leave) keep die()'s normal nonzero-exit
-    behaviour."""
-    if os.environ.get("BCT_PANE_ID"):
-        return                      # BCT pane — statusline auto-invite owns this
-    ensure_stable_copy()
+    mark_session()'s only other caller is session_start(), and gc_markers() collects any
+    marker whose owning pid reads dead. claude_pid() is a best-effort ancestor walk: if it
+    ever resolves to the wrong pid, a LIVE session's marker is collected the moment that
+    stranger exits — live_sessions() empties, the daemon exits, and nothing re-creates the
+    marker, so that session is deaf for the rest of its life with no way to repair itself.
+    Re-marking from the delivery hooks is what makes the marker self-healing, and it
+    refreshes the mtime that the pid-0 (Windows) MARKER_TTL fallback rides on."""
+    sid = hook_session_id(payload)
+    if sid:
+        mark_session(sid)
+
+
+def compose_digest(item, dropped=0):
+    """Mirror BCT's local chatInjection shape: identity line, the room lines exactly as BCT
+    returned them, then the reply instruction. Capped — a backlog that rotted for hours must
+    not dump 4000 lines into a turn.
+
+    The byte cap is applied to the identity+room-lines body ONLY, and REPLY_HINT is
+    appended after truncation, never before it: a single mention line longer than
+    DIGEST_MAX_BYTES must not slice REPLY_HINT away along with it, which would hand
+    claude a blocked turn with a mention and no instruction for how to answer it."""
+    name = item.get("name") or default_name()
+    lines = [f"[bct-chat] 단체 채팅방 — 당신은 @{name} 입니다. 새 메시지:"]
+    if dropped:
+        lines.append(f"(오래된 멘션 {dropped}건 생략)")
+    body = [l for l in (item.get("text") or "").splitlines() if l]
+    if len(body) > DIGEST_MAX_LINES:
+        body = body[-DIGEST_MAX_LINES:]
+        lines.append(f"(앞부분 생략 — 최근 {DIGEST_MAX_LINES}줄만)")
+    lines += body
+    text = "\n".join(lines)
+    hint_bytes = ("\n" + REPLY_HINT).encode("utf-8")
+    budget = max(DIGEST_MAX_BYTES - len(hint_bytes), 0)
+    text_bytes = text.encode("utf-8")
+    if len(text_bytes) > budget:
+        text = text_bytes[:budget].decode("utf-8", "ignore") + "\n(생략)"
+    return text + "\n" + REPLY_HINT
+
+
+def chain_count(active):
+    """`stop_hook_active` says the turn is only continuing because WE blocked it. Count the
+    automatic re-engagements and stop at CHAIN_CAP: two standby remotes mentioning each
+    other must not bill turns forever with no human in the loop (D10).
+
+    A turn the user drove (active False) is not a chain at all — it reads 0 without even
+    consulting the file, so any human prompt starts the count over."""
+    if not active:
+        return 0
+    obj = load(CHAIN) or {}
     try:
-        sid = hook_session_id()
-        if not sock_available():
-            return                  # no ssh session forwarding the socket
-        if sid:
-            mark_session(sid)       # before spawning: the daemon exits on an empty set
+        return int(obj.get("n", 0))
+    except (AttributeError, TypeError, ValueError):
+        return 0                     # a corrupt counter must not cost us the delivery
+
+
+def deliver(item, path, dropped):
+    """Print, THEN ack. A crash in between leaves the item in processing/, where the orphan
+    sweep returns it to the inbox: at-least-once (a rare duplicate) beats a silent loss."""
+    print(json.dumps({"decision": "block", "reason": compose_digest(item, dropped)},
+                     ensure_ascii=False))
+    inbox_ack(path)
+
+
+def stop_hook():
+    """Always exits 0: hooks.json falls back python3 -> python on ANY nonzero exit, which
+    would re-run the whole hook with stdin already drained."""
+    try:
+        payload = hook_payload()
+        if os.environ.get("BCT_PANE_ID"):
+            return                       # BCT pane — native push owns delivery
         try:
-            ensure_membership()     # no-op if seated; polls PENDING; else requests within budget
+            remark_session(payload)      # before the spawn: the daemon exits on an empty set
         except (Exception, SystemExit):
-            pass                    # join failed — still spawn the heartbeat below
-        if sid:
-            spawn_heartbeat()
+            pass                         # a marker failure must not cost this turn's delivery
+        ensure_daemon()                  # every hook is a spawn point
+        active = bool(payload.get("stop_hook_active"))
+        n = chain_count(active)
+        if n >= CHAIN_CAP:
+            return                       # capped: the item stays in the inbox for the user
+        recover_orphans()
+        got = inbox_claim()
+        if got is None and chat_mode() == "standby":
+            got = inbox_wait(STANDBY_HOLD, poll=INBOX_POLL)
+        if got is None:
+            if not active:
+                forget(CHAIN)
+            return                       # graceful degradation: the daemon keeps listening
+        save(CHAIN, {"n": n + 1})
+        deliver(got[1], got[0], take_dropped())
     except (Exception, SystemExit):
-        pass                        # never let a hook verb trigger the python3->python fallback
+        pass
+
+
+def prompt_submit_hook():
+    """The digest rides along as CONTEXT with the user's prompt — this is what reaches a
+    session that was never woken (cold idle). Never holds. Always exits 0."""
+    try:
+        payload = hook_payload()
+        if os.environ.get("BCT_PANE_ID"):
+            return
+        try:
+            remark_session(payload)
+        except (Exception, SystemExit):
+            pass                         # a marker failure must not cost this turn's delivery
+        ensure_daemon()
+        recover_orphans()
+        forget(CHAIN)                    # a user prompt ends any automatic chain — even one
+                                          # that finds an empty inbox; the human engaging IS
+                                          # the reset, not the mention that happens to follow
+        got = inbox_claim()
+        if got is None:
+            return
+        print(compose_digest(got[1], take_dropped()))
+        inbox_ack(got[0])
+    except (Exception, SystemExit):
+        pass
+
+
+def session_start():
+    """LOCAL ONLY: stable copy, marker, daemon. The join itself is the daemon's first tick —
+    which is what fixes D3 (a claude started before the tunnel is up used to early-return
+    with no marker and no daemon, and nothing ever repaired that session)."""
+    try:
+        if os.environ.get("BCT_PANE_ID"):
+            return                       # BCT pane — statusline auto-invite owns this
+        ensure_stable_copy()
+        sid = hook_session_id(hook_payload())
+        if not sid:
+            return                       # an interactive run is not a session — no marker
+        mark_session(sid)                # before spawning: the daemon exits on an empty set
+        ensure_daemon()
+    except (Exception, SystemExit):
+        pass
 
 
 def session_end():
-    """SessionEnd hook: drop this session's marker. The daemon is NOT killed — another
-    claude session on this host may still be in the room; it exits on its own once the
-    marker set empties.
-
-    Invariant: this verb must always exit 0 too — see session_start()'s docstring."""
+    """Drop this session's marker. The daemon is NOT killed — another claude session on this
+    host may still be in the room; it exits on its own once the marker set empties."""
     try:
-        sid = hook_session_id()
+        if os.environ.get("BCT_PANE_ID"):
+            return                       # BCT pane — every hook verb is a no-op there
+        sid = hook_session_id(hook_payload())
         if sid:
             unmark_session(sid)
     except (Exception, SystemExit):
         pass
 
 
-def compose_digest(name, read_text):
-    """Mirror BCT's local chatInjection shape: identity line, the unseen lines
-    exactly as chat-read returned them, then the reply instruction."""
-    lines = [f"[bct-chat] 단체 채팅방 — 당신은 @{name} 입니다. 새 메시지:"]
-    lines += [l for l in read_text.splitlines() if l]
-    lines.append(REPLY_HINT)
-    return "\n".join(lines)
-
-
-def drain_stdin():
-    """Hook payloads arrive on stdin; read them off so the writer never blocks,
-    but never block on a tty ourselves."""
-    try:
-        if sys.stdin is not None and not sys.stdin.isatty():
-            sys.stdin.read()
-    except Exception:
-        pass
-
-
-def pending_digest():
-    """The digest to deliver, or None. chat-peek decides (cursor-preserving —
-    a non-mention backlog stays unseen for a future mention delivery, same
-    semantics as BCT's local push); only a mentioned backlog is consumed via
-    chat-read. Every failure path — no socket, no identity, an old BCT without
-    chat-peek, a read error — is None: the hooks must never disturb a turn."""
-    if os.environ.get("BCT_PANE_ID"):
-        return None                  # BCT-pane claude — native push owns delivery
-    if not sock_available() or not identity():
-        return None
-    r = rpc("chat-peek", [], identity())
-    parts = (r.get("text") or "").split() if r.get("ok") else []
-    if len(parts) != 2 or parts[1] != "1":
-        return None
-    rd = rpc("chat-read", [], identity())
-    text = rd.get("text") or ""
-    if not rd.get("ok") or not text or text == NO_NEW:
-        return None
-    obj = load(IDENTITY) or {}
-    return compose_digest(obj.get("name", default_name()), text)
-
-
-def standby_enabled():
-    """① idle standby window is ON unless BCT_CHAT_STANDBY is a disable value."""
-    v = os.environ.get("BCT_CHAT_STANDBY", "").strip().lower()
-    return v not in ("0", "off", "false", "no")
-
-
-def standby_listen_digest():
-    """Hold ONE server-push chat-listen window (~30s). Return the digest (wrapped
-    like pending_digest) if a mention was pushed, else None. Every failure path is
-    None — a hook must never disturb a turn."""
-    if os.environ.get("BCT_PANE_ID"):
-        return None
-    if not sock_available() or not identity():
-        return None
-    r = rpc("chat-listen", [], identity(), timeout=40)
-    if not r.get("ok"):
-        return None
-    text = r.get("text") or ""
-    if not text or text in (NO_NEW, NO_MENTION):
-        return None
-    obj = load(IDENTITY) or {}
-    return compose_digest(obj.get("name", default_name()), text)
-
-
-def stop_hook():
-    """Stop hook: block the turn end with the digest when mentioned — claude
-    answers the room in place. When nothing is pending and standby is enabled, hold one
-    server-push window (~30s, ① idle standby) so an otherwise-idle joined claude still
-    receives. The window never blocks empty (sentinel → exit), so there is no turn
-    churn. Always exits 0 (see session_start docstring)."""
-    drain_stdin()
-    try:
-        d = pending_digest()
-        if d is None and standby_enabled():
-            d = standby_listen_digest()
-        if d:
-            print(json.dumps({"decision": "block", "reason": d}, ensure_ascii=False))
-    except (Exception, SystemExit):
-        pass
-
-
-def prompt_submit_hook():
-    """UserPromptSubmit hook: same detection, but the digest rides along as
-    CONTEXT (plain stdout) with the user's prompt — covers a fully idle claude
-    the moment the user next engages. Always exits 0."""
-    drain_stdin()
-    try:
-        d = pending_digest()
-        if d:
-            print(d)
-    except (Exception, SystemExit):
-        pass
-
-
 # ---- cli ---------------------------------------------------------------
-"""Entry point: argv dispatch for the join/send/read/... verbs and hook shims."""
-import json, os, re, socket, subprocess, sys, time
+"""The verbs. argparse, not hand-rolled scanning: `wait --timeuot 60` used to mean 300s
+and `heartbeat --interval -1` reached time.sleep(-1)."""
+import argparse, json, os, re, socket, subprocess, sys, time
 
 
 def die(msg):
@@ -964,88 +1217,110 @@ def die(msg):
     sys.exit(1)
 
 
+def positive(v):
+    f = float(v)
+    if f <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return f
+
+
+def do_read():
+    """Drain everything the daemon captured, oldest first, THEN chat-read for anything
+    newer. Print, THEN ack — one item at a time. A crash mid-drain (Ctrl-C, SIGKILL, a
+    wrapper timeout) must leave the not-yet-printed item in processing/, where
+    recover_orphans() returns it to the inbox: at-least-once (a rare duplicate) beats
+    a silent loss. Claiming the whole run and acking as it goes (the reverse order)
+    would delete items the user never saw."""
+    while True:
+        got = inbox_claim()
+        if not got:
+            break
+        print(got[1].get("text") or "")
+        inbox_ack(got[0])
+    r = authed("chat-read", [])
+    if not r.get("ok"):
+        die(r.get("error", "error"))
+    text = r.get("text", "")
+    if text and text != NO_NEW:
+        print(text)
+
+
+def do_wait(timeout, die_on_timeout=True):
+    """Wait on the INBOX. The daemon owns the socket; a second chat-read poller here would
+    consume the cursor out from under it (D13). `listen` is the same wait — it just does not
+    die() on an empty window: it is a single server-push-shaped turn (the old chat-listen
+    semantics), silent and exit-0 when nothing arrived, while `wait` is a human waiting for
+    an answer and must say so loudly."""
+    got = inbox_wait(timeout, poll=1.0)
+    if not got:
+        if die_on_timeout:
+            die(f"timeout: no new message within {int(timeout)}s")
+        return
+    print(got[1].get("text") or "")
+    inbox_ack(got[0])
+
+
+HOOK_VERBS = ("session-start", "session-end", "stop-hook", "prompt-submit")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="bct-chat.py", description="BCT group-chat external client")
+    sub = p.add_subparsers(dest="verb", required=True)
+    j = sub.add_parser("join"); j.add_argument("name", nargs="*")
+    sub.add_parser("leave")
+    s = sub.add_parser("send"); s.add_argument("message", nargs="*")
+    sub.add_parser("read")
+    sub.add_parser("list")
+    for v in ("wait", "listen"):
+        w = sub.add_parser(v)
+        w.add_argument("--timeout", type=positive, default=300)
+    for v in HOOK_VERBS:
+        sub.add_parser(v)
+    for v in ("daemon", "heartbeat"):
+        d = sub.add_parser(v)
+        d.add_argument("--interval", type=positive, default=PRESENCE_INTERVAL)
+        d.add_argument("--listen-timeout", type=positive, default=LISTEN_TIMEOUT)
+        d.add_argument("--max-uptime", type=positive, default=None,
+                       help=argparse.SUPPRESS)     # accepted and ignored: back-compat
+    return p
+
+
 def main(argv):
-    if not argv:
-        die("usage: bct-chat.py <join|send|read|wait|listen|list|leave|session-start|session-end|stop-hook|prompt-submit> …")
-    verb, rest = argv[0], argv[1:]
-    if verb == "join":
-        clear_join_state()                    # manual intent always wins — clears a suspension too
-        do_join(" ".join(rest) or default_name())
-    elif verb == "session-start":
-        session_start()
-    elif verb == "session-end":
-        session_end()
-    elif verb == "stop-hook":
-        stop_hook()
-    elif verb == "prompt-submit":
-        prompt_submit_hook()
-    elif verb == "send":
-        msg = " ".join(rest)
-        if not msg:
-            die('send needs "<message>"')
-        r = authed("chat-send", [msg])
+    if argv and argv[0] in HOOK_VERBS:
+        # The hook verbs take no flags and must always exit 0 — hooks.json falls back
+        # python3 -> python on ANY nonzero exit, and the re-run sees stdin already
+        # drained. Dispatch directly, before argparse ever gets a chance to raise its
+        # own SystemExit(2) on some unexpected argv.
+        {"session-start": session_start, "session-end": session_end,
+         "stop-hook": stop_hook, "prompt-submit": prompt_submit_hook}[argv[0]]()
+        return
+    a = build_parser().parse_args(argv)
+    v = a.verb
+    if v == "join":
+        clear_join_state()                         # a human at the shell always wins
+        do_join(" ".join(a.name) or default_name())
+    elif v == "leave":
+        do_leave()
+    elif v == "send":
+        if not a.message:
+            die('send needs "<message>"')     # argparse's generic "required: message" is
+                                               # useless at a remote shell; say what to type
+        r = authed("chat-send", [" ".join(a.message)])
         if not r.get("ok"):
             die(r.get("error", "error"))
-    elif verb == "read":
-        r = authed("chat-read", [])
-        if not r.get("ok"):
-            die(r.get("error", "error"))
-        print(r.get("text", ""))
-    elif verb == "wait":
-        timeout = 300
-        if "--timeout" in rest:
-            i = rest.index("--timeout")
-            if i + 1 >= len(rest) or not rest[i + 1].isdigit():
-                die("wait --timeout <seconds>")
-            timeout = int(rest[i + 1])
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            r = authed("chat-read", [])
-            if not r.get("ok"):
-                die(r.get("error", "error"))
-            if r.get("text") and r["text"] != NO_NEW:
-                print(r["text"])
-                return
-            time.sleep(2)
-        die(f"timeout: no new message within {timeout}s")
-    elif verb == "listen":
-        # Server-push standby: chat-listen holds the connection until a mention
-        # is posted (or ~30s server-side). One call = one turn; the standby loop
-        # re-invokes. 40s socket timeout tolerates the ~30s server hold + slack.
-        r = authed("chat-listen", [], timeout=40)
-        if not r.get("ok"):
-            die(r.get("error", "error"))
-        txt = r.get("text", "")
-        if txt and txt not in (NO_NEW, NO_MENTION):
-            print(txt)
-    elif verb == "list":
+    elif v == "read":
+        do_read()
+    elif v == "list":
         r = authed("chat-list", [])
         if not r.get("ok"):
             die(r.get("error", "error"))
         print(r.get("text", ""))
-    elif verb == "leave":
-        do_leave()
-    elif verb == "heartbeat":
-        interval, max_uptime = HEARTBEAT_INTERVAL, HEARTBEAT_MAX_UPTIME
-        if "--interval" in rest:
-            i = rest.index("--interval")
-            if i + 1 >= len(rest):
-                die("heartbeat --interval <seconds>")
-            try:
-                interval = float(rest[i + 1])
-            except ValueError:
-                die("heartbeat --interval <seconds>")
-        if "--max-uptime" in rest:
-            i = rest.index("--max-uptime")
-            if i + 1 >= len(rest):
-                die("heartbeat --max-uptime <seconds>")
-            try:
-                max_uptime = float(rest[i + 1])
-            except ValueError:
-                die("heartbeat --max-uptime <seconds>")
-        do_heartbeat(interval, max_uptime)
-    else:
-        die(f"unknown verb: {verb}")
+    elif v == "wait":
+        do_wait(a.timeout)
+    elif v == "listen":
+        do_wait(a.timeout, die_on_timeout=False)
+    elif v in ("daemon", "heartbeat"):
+        do_daemon(presence_interval=a.interval, listen_timeout=a.listen_timeout)
 
 if __name__ == "__main__":
     main(sys.argv[1:])

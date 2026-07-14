@@ -9,7 +9,7 @@ Spec: docs/superpowers/specs/2026-07-12-chat-external-participants-design.md
 """
 import json, os, re, socket, subprocess, sys, time
 
-ARTIFACT = os.path.abspath(__file__)   # the concatenated single file; what spawn_heartbeat re-execs
+ARTIFACT = os.path.abspath(__file__)   # the concatenated single file; what ensure_daemon re-execs
 
 if hasattr(sys.stdout, "reconfigure"):
     # Wire and room text are UTF-8; never trust the locale (Korean Windows = cp949).
@@ -32,9 +32,16 @@ NO_NEW = "(새 메시지 없음)"
 NO_MENTION = "(새 멘션 없음)"          # chat-listen timeout sentinel (server push)
 NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 SESSIONS_DIR = os.path.join(STATE_DIR, "sessions")
+MARKER_TTL = 7 * 86400          # a marker with no pid to probe (Windows) ages out this slowly:
+                                 # GC'ing a LIVE session's marker costs it its ear, while a
+                                 # leaked one only costs a phantom seat — so err long
 PIDFILE = os.path.join(STATE_DIR, "heartbeat.pid")
-HEARTBEAT_INTERVAL = 240        # 4 min — comfortably inside BCT's 10-min prune window
-HEARTBEAT_MAX_UPTIME = 43200    # 12 h — backstop for a marker leaked by a crashed session
+PIDFILE_STALE = 90              # pidfile mtime older than this = no daemon (with proc_alive)
+PRESENCE_INTERVAL = 240         # 4 min — comfortably inside BCT's 10-min prune window
+LISTEN_TIMEOUT = 40             # BCT holds chat-listen ~30s; 40 covers the hold plus slack
+BACKOFF_MIN = 60                # a dead tunnel is waited out, never died of
+BACKOFF_MAX = 300
+JOIN_POLL = 15                  # while unseated: how long between join/poll attempts
 
 STABLE = os.path.join(STATE_DIR, "bct-chat.py")
 
@@ -44,7 +51,23 @@ DROPPED = os.path.join(STATE_DIR, "dropped.json")
 INBOX_CAP = 50              # a deeper queue means nobody has been home for a long time
 ORPHAN_AGE = 120            # a processing/ item older than this belonged to a dead hook
 
+CHAIN = os.path.join(STATE_DIR, "chain.json")
+CHAIN_CAP = 3               # automatic re-engagements (stop_hook_active) before we stop
+                             # delivering: two standby remotes mentioning each other would
+                             # otherwise bill turns forever with no human in the loop
+STANDBY_HOLD = 900          # standby's LOCAL inbox wait — a directory poll, not a socket.
+                             # Bounded by hooks.json's Stop timeout (960s), which claude-code
+                             # honours as-is: the hook config schema caps nothing
+                             # (timeout: z.number().positive()) and the command spawn takes
+                             # `timeout * 1000` ms straight, with no clamp
+DIGEST_MAX_LINES = 200      # a backlog that rotted for hours must not dump 4000 lines
+DIGEST_MAX_BYTES = 16384     # into a turn — cap the lines AND the bytes
+
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+CLAUDE_COMM_RE = re.compile(r"claude|node", re.I)   # a hook ancestor plausible enough to
+                                                     # trust as this session's claude — the
+                                                     # CLI is a node program, and a marker
+                                                     # GC'd on a wrong pid costs an ear
 
 REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
               '(명단: `python3 ~/.bct-chat/bct-chat.py list`, 새 메시지 확인: '

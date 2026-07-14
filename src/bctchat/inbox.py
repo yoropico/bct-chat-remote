@@ -1,7 +1,16 @@
 """The local mention inbox: the durability boundary between the daemon's ear and the
 hooks' mouth. The daemon does not issue its next chat-listen until the item is here,
 so a message whose server-side cursor has advanced is always already on local disk."""
-import json, os, re, socket, subprocess, sys, time
+import itertools, json, os, re, socket, subprocess, sys, time
+
+_PUT_SEQ = itertools.count()   # tie-breaker for inbox_put()'s filename: time_ns() alone can
+                                # collide when several puts land in the same process within
+                                # one clock tick — observed in practice on Windows CI, whose
+                                # effective clock resolution under virtualization is coarser
+                                # than a tight Python loop's per-iteration cost. Two items
+                                # sharing a filename would silently clobber one another; the
+                                # counter guarantees every put() this process ever makes gets
+                                # a distinct, FIFO-ordered name regardless of clock ties.
 
 
 def _items(d):
@@ -77,7 +86,8 @@ def inbox_put(text, name):
                       if _evict(os.path.join(INBOX_DIR, n)))
         if dropped:
             _bump_dropped(dropped)
-    path = os.path.join(INBOX_DIR, f"{time.time_ns()}-{os.getpid()}.json")
+    path = os.path.join(INBOX_DIR,
+                        f"{time.time_ns():020d}-{os.getpid()}-{next(_PUT_SEQ):012d}.json")
     atomic_write(path, json.dumps({"text": text, "capturedAt": time.time(), "name": name},
                                   ensure_ascii=False))
     return path
@@ -114,7 +124,12 @@ def inbox_ack(path):
     forget(path)
 
 
-_SIDECAR_RE = re.compile(r"\.(\d+)\.(?:evict|claim|bump|tmp)$")
+_SIDECAR_RE = re.compile(r"\.(\d{1,10})\.(?:evict|claim|bump|tmp)$")
+# The digit bound keeps int() cheap; it is NOT what makes a hand-planted absurd pid
+# safe. It cannot be: the OverflowError boundary (2147483647) sits INSIDE any 10-digit
+# range, so a bounded regex still admits pids that would blow up os.kill(). The real
+# guard is proc_alive()'s explicit PID_MAX range check, which returns False for
+# anything outside pid_t instead of raising something no caller catches.
 
 
 def _sweep_sidecars(d, now):
@@ -138,9 +153,12 @@ def _sweep_sidecars(d, now):
     closes the race, not a staleness threshold.
 
     Once the owner is confirmed dead, ORPHAN_AGE is still checked as a second,
-    independent condition, so a pid number that has since been recycled by an
-    unrelated new process can't make an otherwise-fresh sidecar look sweepable the
-    moment its original owner is gone.
+    independent condition — not as a defense against pid recycling. Recycling can't
+    cause a WRONG delete: if the pid in a sidecar's name has since been reused by a
+    new, unrelated process, proc_alive() reads it as alive and the sidecar is skipped
+    regardless of mtime, which only DELAYS cleanup (the sidecar lingers until that
+    new process is also gone), never triggers an early one. ORPHAN_AGE is just an
+    extra staleness margin applied once the owner is already confirmed dead.
 
     .evict sidecars need no further guard beyond the pid check: _evict() never
     reads one back, so a sweep that beats its forget() just makes that forget() a

@@ -26,16 +26,16 @@ class StableCopyTests(unittest.TestCase):
         r = run_session_start(CLIENT, self.home)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.path.exists(self.stable))
-        with open(self.stable) as f, open(CLIENT) as g:
+        with open(self.stable, encoding="utf-8") as f, open(CLIENT, encoding="utf-8") as g:
             self.assertEqual(f.read(), g.read())
 
     def test_refreshes_stale_copy(self):
         os.makedirs(os.path.dirname(self.stable))
-        with open(self.stable, "w") as f:
+        with open(self.stable, "w", encoding="utf-8") as f:
             f.write("# stale\n")
         r = run_session_start(CLIENT, self.home)
         self.assertEqual(r.returncode, 0, r.stderr)
-        with open(self.stable) as f, open(CLIENT) as g:
+        with open(self.stable, encoding="utf-8") as f, open(CLIENT, encoding="utf-8") as g:
             self.assertEqual(f.read(), g.read())
 
     def test_running_the_stable_copy_is_a_noop(self):

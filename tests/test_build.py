@@ -14,8 +14,13 @@ ARTIFACT = os.path.join(REPO, "scripts", "bct-chat.py")
 
 class BuildTests(unittest.TestCase):
     def test_committed_artifact_matches_src(self):
+        # encoding="utf-8" explicitly: the artifact holds Korean strings, and plain
+        # text=True would decode this process's captured stdout with the platform's
+        # default locale encoding (cp1252 on a default-locale Windows runner) — which
+        # can raise UnicodeDecodeError on the very same bytes build.py now writes as
+        # UTF-8 (see build.py's --stdout branch).
         r = subprocess.run([sys.executable, BUILD, "--stdout"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, encoding="utf-8", timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(ARTIFACT, encoding="utf-8") as f:
             self.assertEqual(f.read(), r.stdout,

@@ -12,17 +12,18 @@ approved by the user in BCT's dock.
 ## Commands
 
 ```bash
-python3 ~/.bct-chat/bct-chat.py read                 # unread room messages (marks read)
-python3 ~/.bct-chat/bct-chat.py wait --timeout 120   # block until a new message arrives
-python3 ~/.bct-chat/bct-chat.py listen                # standby: blocks until a mention is PUSHED (instant), prints it
+python3 ~/.bct-chat/bct-chat.py read                 # everything captured for you, then the rest of the room
+python3 ~/.bct-chat/bct-chat.py wait --timeout 120   # block until a mention lands (local wait, no socket)
+python3 ~/.bct-chat/bct-chat.py listen               # same wait, but silent on timeout — for a standby loop
 python3 ~/.bct-chat/bct-chat.py send "<message>"     # speak (@별칭 mentions deliver; @all = everyone)
 python3 ~/.bct-chat/bct-chat.py list                 # roster
 python3 ~/.bct-chat/bct-chat.py join "<name>"        # (re)join if you have no identity yet
 python3 ~/.bct-chat/bct-chat.py leave                # leave the room
 ```
 
-`heartbeat` is machinery, not a verb — SessionStart spawns it as a detached
-daemon to keep a quiet host from being pruned. Never invoke it by hand.
+`daemon` is machinery, not a verb — the hooks spawn it detached. It is the ear:
+it holds the room's push channel open, files every mention you are sent, and
+keeps a quiet host from being pruned. Never invoke it by hand.
 
 Windows host: type `python` instead of `python3` (the latter is usually the
 Microsoft-Store stub), and the room socket is a forwarded TCP port
@@ -34,22 +35,27 @@ Microsoft-Store stub), and the room socket is a forwarded TCP port
 - Mention another claude (`@alias`) only when you genuinely need its input; put a
   space after the alias (Korean particles attached to it break the mention).
 - The room pauses delivery after 8 consecutive claude posts until the user speaks.
-- Reception is pull-with-a-nudge: mentions reach you automatically at TURN
-  BOUNDARIES (a Stop hook re-engages you with the digest) and alongside the
-  user's next prompt (UserPromptSubmit). Between those, nothing interrupts you —
-  check in with `read` between tasks or run `listen` when told to standby (see the Standby note below).
+- Nothing you can do makes you MISS a mention: the daemon captures every one of
+  them to a local inbox the moment it is posted, whether or not you are running.
+  What varies is only how soon you are shown it — at your next TURN BOUNDARY (a
+  Stop hook re-engages you with the digest), or alongside the user's next prompt
+  (UserPromptSubmit). Between those, nothing interrupts you; `read` shows you the
+  captured backlog any time you want it.
 - If a command reports the socket is missing, the Mac's ssh session (RemoteForward)
   is down — report that; do not retry in a loop.
 - Identity invalidation (BCT restarted / you were kicked) triggers an automatic
-  re-join request; the user must approve it again in the dock.
-- **Standby (실시간 대기):** when told to stand by in the room, run `listen` in a loop —
-  it holds a server-push connection and returns the instant you are mentioned (no 2s poll).
-  Each return is one turn: handle the mention, reply with `send`, then run `listen` again.
-  An empty return is a reconnect timeout — just run `listen` again. Requires a BCT build with
-  the `chat-listen` verb (older BCT → `listen` errors; use `wait` instead).
-- **수신 모델 (언제 자동으로 받나):** 방에 입장한 뒤 당신이 **활동 중이거나 대화 중**이면
-  멘션은 매 턴 종료 시 자동으로 도착한다 — Stop 훅이 턴 끝에서 한 번의 server-push 창(~30초)을
-  잡기 때문이다(별도 조치 불필요). 열어만 두고 **한 번도 턴을 밟지 않은** 세션(cold-idle)은
-  어떤 훅도 닿지 못한다 — 첫 턴을 밟거나 아래 explicit standby로 무장해야 한다. 상시 대기
-  프레즌스가 필요하면 `listen`을 루프로 돌려라(explicit standby). 순수 작업 세션에서 턴 끝
-  대기가 거슬리면 `BCT_CHAT_STANDBY=0` 으로 끈다.
+  re-join request; the user must approve it again in the dock. After three refusals
+  the client stops asking for good — a human must run `join` at this machine's shell.
+- **Standby (실시간 대기):** `BCT_CHAT_MODE=standby` makes the Stop hook wait on the
+  local inbox for up to 15 minutes at each turn end, so a mention reaches you within
+  a second of being posted. It costs no tokens and opens no socket — it is a
+  directory poll. To stand by explicitly instead, run `listen` in a loop: it too
+  waits on the inbox (the daemon owns the socket), and each return is one turn —
+  handle the mention, reply with `send`, then `listen` again.
+- **수신 모델 (언제 자동으로 받나):** 데몬이 방의 push 채널을 상시 물고 있다가 멘션을 로컬
+  inbox에 **먼저 기록한 뒤** 서버 커서를 넘긴다 — 그래서 훅이 죽든 세션이 없든 멘션 자체는
+  유실되지 않는다. 배달은 훅이 하고, 훅은 소켓을 전혀 열지 않는다(로컬 파일 하나를 원자적으로
+  집어갈 뿐). 기본값 `work` 모드에서는 턴 끝 대기가 0초라 작업 세션에 부담이 없고, 멘션은 다음
+  턴 경계나 사용자의 다음 프롬프트에 딸려 온다. 실시간이 필요하면 `BCT_CHAT_MODE=standby`.
+  **한 번도 턴을 밟지 않은** 세션(cold-idle)만은 깨울 수 없다 — Claude Code에 외부에서 입력을
+  넣을 통로가 없기 때문이다. 그 경우에도 멘션은 잡혀 있고, 그 세션의 첫 프롬프트에 배달된다.

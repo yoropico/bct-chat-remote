@@ -29,12 +29,13 @@ All under `~/.bct-chat/` (override the whole directory with `$BCT_CHAT_HOME`):
 | `identity.json` | `{"participantID", "name"}` — our seat in the room |
 | `pending-join.json` | an outstanding join request; discarded once older than `PENDING_TTL` |
 | `join-state.json` | `{"attempts", "nextAttemptAt", "suspended", "lastOutcome"}` — the join budget |
-| `sessions/<session-id>` | one marker per live claude session on this host (the daemon's refcount) |
-| `heartbeat.pid` | the presence daemon's pidfile; its mtime is the liveness signal |
+| `sessions/<session-id>` | `{"pid", "startedAt"}` — one marker per live claude session on this host (the daemon's refcount) |
+| `heartbeat.pid` | the presence daemon's pidfile; it holds the daemon's pid and its mtime is the liveness signal |
 | `bct-chat.py` | the stable copy |
 | `inbox/<time_ns>-<pid>.json` | a captured mention, not yet claimed by a hook |
 | `processing/<pid>-<time_ns>-<pid>.json` | a mention claimed by a hook, not yet acked |
 | `dropped.json` | `{"n"}` — mentions the inbox cap has thrown away, not yet reported |
+| `chain.json` | `{"n"}` — consecutive automatic re-engagements of the Stop hook (§5's chain cap) |
 
 Every write under this directory is atomic (temp file + `os.replace`, atomic on both
 POSIX and Windows): a hook killed mid-write can never leave a 0-byte `identity.json`
@@ -65,38 +66,97 @@ line of JSON out (`{"ok","text","error"}`).
 
 ## 4. Verbs
 
+Argument parsing is `argparse` (stdlib) — the sole new import in the whole client. The
+old hand-rolled argv scanning had silent bugs: `wait --timeuot 60` (a typo) silently
+meant the 300 s default, and `heartbeat --interval -1` reached `time.sleep(-1)`.
+`argparse` makes a misspelled or negative/zero flag a loud, nonzero-exit error instead.
+
 | Verb | Behaviour |
 |---|---|
 | `join [name]` | request a seat; blocks up to 5 min for the user's approval in BCT's chat dock. Manual intent overrides any cooldown. |
 | `leave` | leave the room and drop the identity |
-| `send <msg>` | post to the room |
-| `read` | print unseen messages (advances the server-side cursor) |
+| `send <msg>` | post to the room. `<msg>` is required — a bare `send` dies with `send needs "<message>"` rather than argparse's generic "required" error. |
+| `read` | drain the local inbox (§6) first, oldest first, then `chat-read` for anything newer than the daemon has captured. Never touches the socket first — the daemon may already hold what the user is asking for. Each drained item is printed, THEN acked, one at a time — never claim-and-ack the whole backlog before printing any of it, or a crash mid-drain (Ctrl-C, SIGKILL, a wrapper timeout) silently deletes an item the user never saw. A crash between claim and print leaves the item in `processing/`, where the orphan sweep (§6) returns it to the inbox. |
 | `list` | the roster |
-| `wait [--timeout N]` | poll until a new message arrives |
-| `listen` | hold one server-push `chat-listen` window (~30 s server-side) |
-| `heartbeat` | the presence daemon (spawned automatically; not for humans) |
+| `wait [--timeout N]` | wait on the local inbox (§6), **not** `chat-read` — the daemon (§7) owns the socket now, and a second `chat-read` poller here would consume the cursor out from under it. On timeout, exits nonzero with a message. |
+| `listen [--timeout N]` | the same inbox wait as `wait`, but silent and exit-0 on an empty window — a single server-push-shaped turn. |
+| `daemon [--interval N] [--listen-timeout N]` | the presence daemon (§7) — spawned automatically by the hooks; not for humans. `heartbeat` is kept as an alias (with the same flags, plus an accepted-and-ignored `--max-uptime` for back-compat), since a remote host's already-running daemon may have been spawned by an older stable copy under that verb. |
 | `session-start`, `session-end`, `stop-hook`, `prompt-submit` | the Claude Code hook verbs |
 
 ## 5. Hook behaviour
 
 The four hook verbs are wired in `hooks/hooks.json`.
 
+- **Invariant: no hook verb opens a socket.** `session-start`, `session-end`,
+  `stop-hook` and `prompt-submit` perform zero RPC. Delivery is a local inbox read
+  (§6); capture is the daemon's job alone (§7). This is what makes "hook timeout <
+  RPC budget" *unrepresentable* rather than merely widened: the old `stop-hook` ran
+  `chat-peek` → `chat-read`, and `chat-read` advances BCT's server-side cursor with
+  no ack verb to replay it — so a hook killed after the cursor moved lost the
+  message outright. A hook that touches no socket can lose nothing, because the
+  cursor moved long before, in the daemon, and only after the message was already on
+  local disk.
 - **Invariant: a hook verb always exits 0.** `hooks.json` falls back from
   `python3` to `python` on ANY nonzero exit, and that re-run would see stdin
-  already drained — no session id, no marker, no daemon, and a duplicate join
-  banner. Every hook swallows `Exception` and `SystemExit` alike.
-- **Invariant: a hook is silent unless it has something to deliver.** A broken
-  tunnel must never disturb a turn.
-- Inside a BCT pane (`$BCT_PANE_ID` set) every hook verb is a no-op — BCT's
-  native chat injection owns delivery there.
-- `session-start`: keep the stable copy current, mark this session live, and make
-  sure the host is in the room and a daemon is running.
-- `session-end`: drop this session's marker. The daemon is not killed — another
-  session on this host may still be in the room.
-- `stop-hook`: when the room has mentioned us, block the finishing turn with the
-  digest so claude answers the room in place.
-- `prompt-submit`: same detection, but the digest rides along as context with the
-  user's next prompt — this is what reaches a session that was idle.
+  already drained — no session id, no marker, no daemon. Every hook swallows
+  `Exception` and `SystemExit` alike.
+- **Invariant: a hook is silent unless it has something to deliver.**
+- **Invariant: no hook ever *increments* `dropped.json`.** Hooks DO touch the file —
+  `take_dropped()` reads and clears it for the next digest, which is its designed
+  consumer — but the counter itself has exactly one writer, the daemon's cap eviction
+  (§6); a hook calling `inbox_put()` or `_bump_dropped()` would reintroduce a
+  lost-update race.
+- Inside a BCT pane (`$BCT_PANE_ID` set) every hook verb is a complete no-op — it
+  claims nothing, spawns nothing. BCT's native chat injection owns delivery there.
+- Every hook is a **daemon spawn point** (`ensure_daemon()`), and every hook that
+  knows its session id **re-marks** it (`sessions/<id>`) before spawning. Re-marking
+  makes the marker self-healing: `claude_pid()` is a best-effort ancestor walk, and
+  if it ever resolved wrong, marker GC would collect a LIVE session's marker, the
+  daemon would exit, and that session would be deaf for good with nothing left to
+  repair it. It also refreshes the mtime that the pid-0 (Windows) `MARKER_TTL`
+  fallback rides on. Marker before spawn, always — a daemon that starts ahead of its
+  own marker sees an empty session set and exits at once.
+
+| Verb | Behaviour |
+|---|---|
+| `session-start` | keep the stable copy current, mark the session, `ensure_daemon()`. An interactive run (no session id on stdin) leaves no marker and spawns nothing. |
+| `session-end` | drop this session's marker. The daemon is not killed — another session on this host may still be in the room; it exits on its own once the marker set empties. |
+| `stop-hook` | claim one mention from the inbox and **block** the finishing turn with the digest, so claude answers the room in place. |
+| `prompt-submit` | claim one mention and print the digest as **context** alongside the user's prompt — this is what reaches a session that was never woken. Never holds. |
+
+**Modes** — `$BCT_CHAT_MODE`, read by `stop-hook` only:
+
+| Mode | Empty inbox at turn end | Cost |
+|---|---|---|
+| `work` (default) | return immediately | ~0 s and 0 tokens per turn |
+| `standby` | wait locally on the inbox for up to `STANDBY_HOLD` (900 s) | 0 tokens, 0 RPC — a directory poll, not a socket |
+
+A working session pays nothing per turn; only an idle session that opted into
+`standby` waits, and it waits on the local filesystem. `BCT_CHAT_STANDBY` survives as
+a legacy variable, and it means what it says: a truthy value (anything other than the
+disable spellings `0`/`off`/`false`/`no`, or unset) turns standby on; `BCT_CHAT_MODE`
+wins whenever it holds a recognized value. `hooks.json` gives `Stop` a 960 s timeout to
+cover the 900 s hold with slack; the other three hooks do no RPC and never hold, so
+10 s is generous. Claude Code's hook config schema imposes no maximum on `timeout`, and
+the command spawn passes the value straight through as the process deadline — but
+whether a *running* Claude Code actually honours a 960 s `Stop` timeout has **not been
+confirmed against the real harness**; this is inferred from the schema and spawn code,
+not observed. If Claude Code clamps it, standby simply ends early — no mention is lost
+either way, because `inbox_wait()` claims and returns in the same breath and
+`recover_orphans()` reclaims anything caught in that window. (Claude Code does clamp
+its *`SessionEnd` shutdown wait* to 60 s, so `SessionEnd` must stay well under that.)
+
+**Chain cap.** `stop_hook_active` in the Stop payload means the turn is only
+continuing because *we* blocked it. `chain.json` counts those automatic
+re-engagements; at `CHAIN_CAP` (3) the hook stops delivering **and** stops holding,
+and the mention **stays in the inbox** for the user's next prompt. Two standby
+remotes mentioning each other must not bill turns forever with no human in the loop.
+Any user-driven turn resets the chain: `prompt-submit` clears the counter, and a Stop
+with `stop_hook_active` false reads the count as 0 regardless of the file.
+
+Delivery is **at-least-once** (§6): a hook that dies between claim and print leaves
+its item in `processing/`, and the orphan sweep — run by every hook and by the daemon
+— returns it to the inbox. A mention is never dropped without being delivered.
 
 ## 6. Inbox
 
@@ -147,35 +207,127 @@ readers of this queue: no socket, no RPC.
   never be made atomic with each other — a sweep can always land in between.
   Checking the owner's liveness instead of racing the clock is what actually
   closes the race. Once the owner is confirmed dead, `ORPHAN_AGE` is still
-  checked as a second condition, so a pid recycled by an unrelated new process
-  can't make an otherwise-fresh sidecar look sweepable.
+  checked as a second, independent condition — not as a defense against pid
+  recycling, which can't cause a wrong delete: a recycled pid reads as alive
+  and only DELAYS cleanup, it never triggers an early one. A pid parsed out of a
+  filename is never trusted as a number either: `proc_alive()` returns False for
+  anything outside `pid_t` (see §10), because `os.kill()` raises `OverflowError`
+  there — not an `OSError` — and that would propagate out of the sweep and out of
+  `gc_markers()`, which the daemon calls outside its per-tick guard.
 
-## 7. Presence
+## 7. Presence — the daemon is the ear
 
-One daemon per host. It exists because BCT prunes an external participant after
-10 minutes of silence, so a live-but-quiet host must keep proving it is there.
+One daemon per host, detached, single-instance via `heartbeat.pid`. It is the only
+thing in the system that talks to the room on its own initiative, and the **only**
+writer of the inbox (§6).
 
-- Spawned by `session-start`, detached, single-instance via `heartbeat.pid`.
-- Ticks every 240 s with a read-only `chat-list` (never `chat-read` — that would
-  consume the cursor).
-- Exits when no session marker is left on this host, when a newer daemon owns the
-  pidfile, after two consecutive failed ticks, or after 12 h.
-- It never deletes a pidfile it does not own.
+- **It holds `chat-listen` continuously** (`LISTEN_TIMEOUT` 40 s, covering BCT's
+  ~30 s server-side hold) and lands each heard mention in the inbox **before** it
+  issues the next listen. That ordering is the whole durability guarantee: BCT's
+  cursor advances when `chat-listen` returns, and there is no ack verb to replay
+  a message with — so the message must be on local disk before anything can move
+  the cursor again. The silence sentinel (`NO_MENTION`/`NO_NEW`) is never an inbox
+  item. A bridge that answers the window instantly instead of holding it is not
+  busy-waited: the re-arm is floored at a tenth of the requested window (≤1 s).
+  For the same reason an `inbox_put()` that **raises** (ENOSPC, EINTR) does not
+  lose the mention: the daemon holds the text in memory and retries the put at the
+  top of the next pass, before it can issue another listen. A transient disk
+  failure costs a delay, not a message; a persistent one falls into the same
+  backoff as any other failed tick, so it never spins hot.
+- **Presence tick**: interleaved with the listen, a read-only `chat-list` every
+  `PRESENCE_INTERVAL` (240 s) — never `chat-read`, which would consume the cursor.
+  It exists because BCT prunes an external participant after 10 minutes of
+  silence, so a live-but-quiet host must keep proving it is there.
+- **Exit conditions are exactly three**: no live session marker is left on this
+  host, a newer daemon owns the pidfile, or the user has left the room (the join
+  budget is suspended *and* we hold no identity). Nothing else gets it out: a dead
+  tunnel, a failed tick, a `die()` raised out of a chained join, a full disk — all
+  are waited out with exponential backoff (`BACKOFF_MIN` 60 s → `BACKOFF_MAX`
+  300 s), never died of. The daemon now holds the capture layer, so **daemon
+  reliability is receive reliability**: the old two-strike suicide and 12-hour
+  max-uptime backstop are gone, because either one silently un-ears a live
+  session, and no hook is listening to notice.
+- **The backoff wait is chunked** (`PIDFILE_STALE / 2` per chunk), refreshing the
+  pidfile's mtime on every chunk. The mtime is the only evidence a daemon is alive
+  and `PIDFILE_STALE` (90 s) is far shorter than `BACKOFF_MAX` (300 s), so a single
+  long sleep would make a perfectly healthy daemon — one waiting out a dead tunnel,
+  the very case this backoff exists for — read as **dead** to `heartbeat_alive()`.
+  Every hook's `ensure_daemon()` would then spawn a rival (every hook is a spawn
+  point), and the incumbent would only stand down minutes later when it woke. The
+  chunks also re-check `live_sessions()`, so a daemon whose last session ended
+  mid-backoff gets out of the way promptly instead of lingering for up to 5 minutes.
+- It never deletes a pidfile it does not own (`pidfile_owner() == os.getpid()` gates
+  every release). On the no-live-session exit it releases the pidfile **before**
+  re-checking the markers, and hands the room back to a fresh `ensure_daemon()` if
+  one reappeared: a session that marks itself during that shutdown sees
+  `heartbeat_alive()` still true, declines to spawn, and would otherwise be left
+  holding a marker with no ear at all.
+- **Seat**: it trusts `identity.json` until the *wire* disagrees. A `NOT_INVITED`
+  reply to its listen or its tick is that disagreement, and only then does it
+  re-join — through `ensure_membership(force=True)` (§8), never a bare
+  `do_join()`, and with `force` scoped to the exact identity the wire disproved.
+  While unseated it polls at `JOIN_POLL` (15 s) and re-probes the seat with one
+  `chat-list`; a spent budget means it asks for nothing at all.
+- **Only the wire seats it.** An identity is a reason to probe, never proof of a
+  seat, and the *absence* of one is the only local fact that means "no seat yet".
+  In particular the daemon must **not** read "the id BCT gave me back is the id it
+  just disproved" as still-unseated: BCT's retire/reseat deliberately hands a
+  re-approved external participant back the **same** `participantID`, preserving
+  its identity *and* its unread cursor across a prune (that is the whole point of
+  it — a live-but-quiet remote must not lose its backlog). Gating on that livelocks:
+  the approval writes the same id straight back, the gate stays true forever,
+  `ensure_membership()` short-circuits on its identity fast path, and the daemon
+  spins every `JOIN_POLL` — alive, seated on the server, and permanently deaf. The
+  `chat-list` probe is the seat detector; if the wire answers `NOT_INVITED` again,
+  the dead identity is simply re-armed for the next `force`. Cost: one extra
+  `chat-list` per `JOIN_POLL` while an approval is pending.
+
+### Liveness and markers
+
+- `heartbeat_alive()` is `heartbeat.pid`'s mtime younger than `PIDFILE_STALE`
+  (90 s) **and** `proc_alive(pidfile_owner())`. Mtime alone called a signal-killed
+  daemon alive for minutes — an ssh-logout `SIGTERM` leaves the pidfile with a
+  fresh mtime — and nothing respawns a corpse that still looks warm.
+- `ensure_daemon()` spawns unless a daemon is already alive, or we are suspended
+  *and* unseated (never resurrect a daemon into a room the user has left). Every
+  hook is a spawn point, not just `session-start`: the hooks do no RPC any more,
+  so they can afford the check on every turn.
+- A session marker holds `{"pid", "startedAt"}`. `claude_pid()` resolves the pid
+  best-effort from the *grandparent* of the hook process (`hooks.json`'s `||`
+  forces an `sh -c` wrapper whose own pid dies with the hook, so `os.getppid()` is
+  useless). A wrong answer is not symmetric — a pid that is not this session's
+  claude makes `gc_markers()` collect a **live** session's marker the moment that
+  stranger exits, the daemon then exits on an empty marker set, and nothing
+  re-creates the marker, so that session is deaf for the rest of its life — while a
+  0 only costs a marker that ages out on `MARKER_TTL`. So it errs toward 0: the
+  ancestor is trusted only when `ps` says it is both alive **and** plausibly claude
+  (`comm` matching claude/node — "still exists at the moment we ask" was never a
+  safety net, since a short-lived wrapper is alive at that moment too). It is 0 on
+  Windows (no cheap ancestor walk), 0 on a host with no `ps`, and 0 for any
+  ancestor that fails either test.
+- `gc_markers()` runs at the top of every daemon pass and collects a marker whose
+  pid is dead, or — where no pid could be resolved — whose mtime is older than
+  `MARKER_TTL` (7 days). It errs long on purpose: a leaked marker only costs a
+  phantom seat, while GC'ing a **live** session's marker costs that session its
+  ear. A marker with an unreadable pid reads as pid 0 (TTL), never as dead.
 
 ## 8. Membership
 
 - The identity outlives a BCT restart, but BCT's memory of it does not — so a
   dead-but-present `identity.json` is expected, and something on the wire (a
   `NOT_INVITED` reply) is what has to notice it, never the file alone.
-- `ensure_membership()` is the **single** automatic-join entry point. Every
-  automatic caller (the SessionStart hook, the presence daemon, `authed()`'s
-  reactive re-join) goes through it, so a second `chat-join` can never fire
-  while one is already outstanding: an outstanding `pending-join.json` is
-  always polled (`chat-join-poll`), never re-requested. `ensure_membership()`
-  normally trusts a truthy `identity()` and returns early without touching the
-  wire; `force=True` skips that fast path for a caller that already has fresh
-  wire evidence the stored identity is dead, not merely absent — the presence
-  daemon's own `NOT_INVITED` tick is that caller, and it is the only one.
+- `ensure_membership()` is the **single** automatic-join entry point. Both
+  automatic callers — the presence daemon (§7) and `authed()`'s reactive re-join —
+  go through it (the hooks make no automatic join at all any more), so a second
+  `chat-join` can never fire while one is already outstanding: an outstanding
+  `pending-join.json` is always polled (`chat-join-poll`), never re-requested.
+  `ensure_membership()` normally trusts a truthy `identity()` and returns early
+  without touching the wire; `force=True` skips that fast path for a caller that
+  already has fresh wire evidence the stored identity is dead, not merely absent —
+  the daemon's `NOT_INVITED` reply is that evidence, and it is the only such
+  caller. It forces only while `identity()` still holds the exact id the wire
+  disproved: forcing past the fast path with a live seat would request a second
+  one.
 - `pending-join.json` retires on its own once older than `PENDING_TTL` (10
   min) — not only on an `approved`/`denied`/`expired` reply. A reply the
   client doesn't recognize (e.g. BCT restarted and forgot the request id) must
@@ -209,6 +361,15 @@ The digest mirrors BCT's local chat injection: an identity line
 (`[bct-chat] 단체 채팅방 — 당신은 @<name> 입니다. 새 메시지:`), the room lines exactly
 as BCT returned them, then `REPLY_HINT` — the instruction telling claude to answer
 with `python3 ~/.bct-chat/bct-chat.py send "<답변>"`.
+
+It is capped: `DIGEST_MAX_LINES` (200) keeps only the most recent lines, and
+`DIGEST_MAX_BYTES` (16 KB) bounds the identity line and room lines — a backlog that
+rotted for hours must not dump 4000 lines into a turn. `REPLY_HINT` is appended
+*after* that byte cap is applied, never before it, so it always survives: a single
+mention line longer than `DIGEST_MAX_BYTES` truncates the room text, never the
+instruction for how to answer it. Anything the inbox cap threw away since the last
+digest is announced first, as `(오래된 멘션 N건 생략)`. `stop-hook` emits the digest as
+`{"decision": "block", "reason": …}`; `prompt-submit` prints it plain.
 
 ## 10. Platforms
 
