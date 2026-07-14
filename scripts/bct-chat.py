@@ -325,8 +325,6 @@ def take_dropped():
         os.rename(DROPPED, claim)
     except OSError:
         return 0
-    os.utime(claim, None)     # age it from the steal, not from dropped.json's last write —
-                               # see _sweep_sidecars: a rename keeps the source's old mtime
     obj = load(claim) or {}
     forget(claim)
     return int(obj.get("n", 0))
@@ -346,8 +344,6 @@ def _bump_dropped(n):
     try:
         os.rename(DROPPED, claim)
         stolen = True
-        os.utime(claim, None)  # age it from the steal, not from dropped.json's last
-                                # write — see _sweep_sidecars: a rename keeps the old mtime
         obj = load(claim) or {}
     except OSError:
         obj = {}
@@ -403,36 +399,49 @@ def inbox_ack(path):
     forget(path)
 
 
-_SIDECAR_RE = re.compile(r"\.(?:evict|claim|bump|tmp)$")
+_SIDECAR_RE = re.compile(r"\.(\d+)\.(?:evict|claim|bump|tmp)$")
 
 
 def _sweep_sidecars(d, now):
     """.evict/.claim/.bump/.tmp sidecars are left behind by a process that dies mid
     rename-steal or mid atomic_write; on a long-lived host they'd otherwise
-    accumulate forever, so anything older than ORPHAN_AGE is swept.
+    accumulate forever, so anything abandoned by a dead owner is swept.
 
-    Correctness DOES depend on this staleness test, and on os.rename preserving the
-    source's mtime rather than resetting it: a .claim/.bump sidecar is born via
-    os.rename(DROPPED, claim), not a write, so without intervention it would inherit
-    dropped.json's old mtime — already stale the instant it's created, since
-    dropped.json can sit unwritten for minutes between drops. A concurrent sweep
-    could then delete a sidecar a live steal is still holding. take_dropped() and
-    _bump_dropped() guard against exactly this by calling os.utime(claim, None)
-    immediately after their steal rename, so a live sidecar's mtime reads as "now",
-    not as whenever dropped.json was last written — this sweep only ever removes one
-    that has genuinely sat abandoned for ORPHAN_AGE.
+    Every sidecar name carries the pid of the process that created it —
+    `<path>.<pid>.<kind>`, the shape _evict()/take_dropped()/_bump_dropped()'s
+    .evict/.claim/.bump and atomic_write's .tmp all share. Correctness rests on
+    that pid, not on mtime: a .claim/.bump sidecar is born via
+    os.rename(DROPPED, claim), not a write, so it inherits dropped.json's OLD mtime
+    rather than getting a fresh one — it can read as already-older-than-ORPHAN_AGE
+    the instant it's created, if dropped.json itself sat unwritten for a while
+    before the steal. A mtime-only test could then delete a sidecar a live steal is
+    still holding, and there is no way to close that window with timing (e.g.
+    refreshing the mtime right after the rename) because the rename and the refresh
+    can never be made atomic with each other — a sweep can always land in the gap
+    between them. So this function never removes a sidecar whose owner
+    (proc_alive()) is still alive, regardless of its mtime; that is what actually
+    closes the race, not a staleness threshold.
 
-    .evict sidecars need no such guard: _evict() never reads one back, so a sweep
-    that beats its forget() just makes that forget() a no-op — the True return still
-    correctly means "we really removed it". .tmp files are born from a real write,
-    so their mtime is genuine from the start."""
+    Once the owner is confirmed dead, ORPHAN_AGE is still checked as a second,
+    independent condition, so a pid number that has since been recycled by an
+    unrelated new process can't make an otherwise-fresh sidecar look sweepable the
+    moment its original owner is gone.
+
+    .evict sidecars need no further guard beyond the pid check: _evict() never
+    reads one back, so a sweep that beats its forget() just makes that forget() a
+    no-op — the True return still correctly means "we really removed it". .tmp
+    files are born from a real write, so their mtime is genuine from the start; the
+    pid guard still keeps a sweep from landing mid-write."""
     try:
         names = os.listdir(d)
     except OSError:
         return
     for name in names:
-        if not _SIDECAR_RE.search(name):
+        m = _SIDECAR_RE.search(name)
+        if not m:
             continue
+        if proc_alive(int(m.group(1))):
+            continue                   # owner is still working it — never sweep
         p = os.path.join(d, name)
         try:
             if now - os.stat(p).st_mtime >= ORPHAN_AGE:

@@ -134,13 +134,21 @@ readers of this queue: no socket, no RPC.
   discarded uncounted rather than bumping this counter from a hook, which would
   reopen it to concurrent writers.
 - **Sidecar sweep**: `.claim`/`.bump`/`.evict`/`.tmp` files left by a process
-  that died mid rename-steal or mid atomic write are swept once older than
-  `ORPHAN_AGE`. A `.claim`/`.bump` sidecar is born by `os.rename`, which
-  preserves the source's mtime rather than resetting it, so `take_dropped()`
-  and the counter bump refresh it with `os.utime` immediately after the steal —
-  otherwise a `dropped.json` that sat unwritten past `ORPHAN_AGE` would hand a
-  freshly stolen sidecar a birth mtime that already reads as stale, and a
-  concurrently running sweep could delete it out from under the steal.
+  that died mid rename-steal or mid atomic write are swept once their owner is
+  gone. Every sidecar name carries the pid that created it
+  (`<path>.<pid>.<kind>`); the sweep parses that pid and skips any sidecar
+  whose owner is still alive, whatever its mtime — a `.claim`/`.bump` sidecar
+  is born by `os.rename`, which preserves the source's mtime rather than
+  resetting it, so it can read as already older than `ORPHAN_AGE` the instant
+  it's created if `dropped.json` sat unwritten for a while before the steal. A
+  mtime-only test cannot tell that case apart from a genuinely abandoned
+  sidecar, and there is no way to close the gap with timing (e.g. refreshing
+  the mtime right after the rename), since the rename and the refresh can
+  never be made atomic with each other — a sweep can always land in between.
+  Checking the owner's liveness instead of racing the clock is what actually
+  closes the race. Once the owner is confirmed dead, `ORPHAN_AGE` is still
+  checked as a second condition, so a pid recycled by an unrelated new process
+  can't make an otherwise-fresh sidecar look sweepable.
 
 ## 7. Presence
 

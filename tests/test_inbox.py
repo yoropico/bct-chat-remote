@@ -56,13 +56,15 @@ class InboxTests(unittest.TestCase):
         # Two threads in ONE process, released at the same instant onto the same
         # one-item inbox, pin the loser's arbitration path: os.rename raises for
         # whichever thread loses the race, and it correctly walks away with None.
-        # That is a real and worthwhile contract, but it is not a stand-in for the
-        # cross-PROCESS os.rename exclusivity the module's design ultimately rests
-        # on — the GIL already serializes these two threads' rename calls at the C
-        # level, so this cannot observe two independent processes racing the same
-        # rename the way inbox_claim() is actually used in production. Not flaky —
-        # os.rename's exclusivity on a shared source either holds every time or the
-        # module's whole design is broken, so a single trial suffices.
+        # CPython releases the GIL around the rename(2) syscall itself, so these two
+        # threads' renames really do reach the kernel concurrently, arbitrated by
+        # the same VFS directory lock a cross-process race would hit — this is a
+        # real and worthwhile contract. It is still not a full stand-in for the
+        # cross-PROCESS case the module's design ultimately rests on, though: the
+        # two threads here share one process's fd table and cwd, which two
+        # independent hook processes never do. Not flaky — os.rename's exclusivity
+        # on a shared source either holds every time or the module's whole design is
+        # broken, so a single trial suffices.
         import threading
         self.mod.inbox_put("only-one", "svr")
         barrier = threading.Barrier(2)
@@ -163,27 +165,32 @@ class InboxTests(unittest.TestCase):
         # sidecars are born via os.rename(DROPPED, claim), not a write, so they
         # inherit dropped.json's mtime rather than getting a fresh one. If
         # dropped.json sat untouched for a long time before the steal, the sidecar
-        # is already older than ORPHAN_AGE the instant it's created — so a
+        # is already older than ORPHAN_AGE the instant it's created. What keeps a
         # recover_orphans() sweep running concurrently, in the window between the
-        # steal and its resolution, could delete it out from under the stealer and
-        # silently zero out the accumulated count. take_dropped() and
-        # _bump_dropped() guard against this with os.utime(claim, None) right after
-        # the steal rename. Pin the interleaving deterministically by hooking
-        # load() to run a sweep at the moment take_dropped() is mid-steal.
+        # steal and its resolution, from deleting it out from under the stealer is
+        # _sweep_sidecars()'s pid guard (see test_sweep_skips_a_sidecar_whose_owner_
+        # pid_is_still_alive for that guard pinned directly) — take_dropped() is
+        # still alive and its own pid is in the sidecar's name, so the sweep must
+        # skip it no matter how stale its mtime reads. Pin the interleaving
+        # deterministically by hooking load() to run a sweep at the moment
+        # take_dropped() is mid-steal.
         self.mod._bump_dropped(7)
         old = time.time() - self.mod.ORPHAN_AGE - 500
         os.utime(self.mod.DROPPED, (old, old))  # simulate dropped.json sitting untouched
 
         state_dir = os.path.dirname(self.mod.DROPPED)
         swept = []
+        fired = []
         real_load = self.mod.load
 
         def hook(path):
             result = real_load(path)
-            before = set(os.listdir(state_dir))
-            self.mod.recover_orphans()          # the concurrent sweep
-            after = set(os.listdir(state_dir))
-            swept.extend(before - after)
+            if not fired:
+                fired.append(True)
+                before = set(os.listdir(state_dir))
+                self.mod.recover_orphans()          # the concurrent sweep
+                after = set(os.listdir(state_dir))
+                swept.extend(before - after)
             return result
 
         self.mod.load = hook
@@ -192,8 +199,29 @@ class InboxTests(unittest.TestCase):
         finally:
             self.mod.load = real_load
 
+        self.assertTrue(fired, "the interleaving was never injected")
         self.assertEqual(swept, [], "the live sidecar was swept out from under the steal")
-        self.assertEqual(n, 7, "the count was lost when the sidecar was swept")
+        self.assertEqual(n, 7)
+
+    def test_sweep_skips_a_sidecar_whose_owner_pid_is_still_alive(self):
+        # Pins the pid guard directly, independent of any timing/injection trickery:
+        # a sidecar named with a LIVE pid must survive the sweep no matter how old
+        # its mtime is, and one named with a pid nothing holds must not.
+        os.makedirs(self.mod.INBOX_DIR, exist_ok=True)
+        live = os.path.join(self.mod.INBOX_DIR, f"item.json.{os.getpid()}.claim")
+        dead = os.path.join(self.mod.INBOX_DIR, "item.json.999999.claim")
+        open(live, "w").close()
+        open(dead, "w").close()
+        old = time.time() - self.mod.ORPHAN_AGE - 500
+        os.utime(live, (old, old))
+        os.utime(dead, (old, old))
+
+        self.mod.recover_orphans()
+
+        self.assertTrue(os.path.exists(live),
+                         "a live owner's sidecar must survive the sweep regardless of mtime")
+        self.assertFalse(os.path.exists(dead),
+                          "a dead owner's ancient sidecar must be swept")
 
     def test_wait_returns_as_soon_as_an_item_lands(self):
         import threading
