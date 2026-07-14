@@ -47,3 +47,9 @@ Microsoft-Store stub), and the room socket is a forwarded TCP port
   Each return is one turn: handle the mention, reply with `send`, then run `listen` again.
   An empty return is a reconnect timeout — just run `listen` again. Requires a BCT build with
   the `chat-listen` verb (older BCT → `listen` errors; use `wait` instead).
+- **수신 모델 (언제 자동으로 받나):** 방에 입장한 뒤 당신이 **활동 중이거나 대화 중**이면
+  멘션은 매 턴 종료 시 자동으로 도착한다 — Stop 훅이 턴 끝에서 한 번의 server-push 창(~30초)을
+  잡기 때문이다(별도 조치 불필요). 열어만 두고 **한 번도 턴을 밟지 않은** 세션(cold-idle)은
+  어떤 훅도 닿지 못한다 — 첫 턴을 밟거나 아래 explicit standby로 무장해야 한다. 상시 대기
+  프레즌스가 필요하면 `listen`을 루프로 돌려라(explicit standby). 순수 작업 세션에서 턴 끝
+  대기가 거슬리면 `BCT_CHAT_STANDBY=0` 으로 끈다.
