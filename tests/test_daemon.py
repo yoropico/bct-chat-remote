@@ -13,7 +13,9 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_heartbeat_helpers import CLIENT, load_fresh_module, reap_daemon, wait_for  # noqa: E402
+from test_heartbeat_helpers import (  # noqa: E402
+    CLIENT, load_fresh_module, reap_daemon, reaped_pid, wait_for,
+)
 from test_tcp_transport import FakeChatServer  # noqa: E402
 
 IDENT = "C1A6063F-0124-4229-9CE3-D757348A70F2"
@@ -295,8 +297,10 @@ class DaemonTests(unittest.TestCase):
         self.mod.do_daemon(presence_interval=0.01, listen_timeout=1)
 
     def test_gc_removes_a_crashed_sessions_marker(self):
+        # A reaped pid, not the constant 999999 — Linux's default pid_max (4194304) makes
+        # 999999 an ordinary, possibly-live pid there (macOS caps at 99999).
         self.mod.save(os.path.join(self.mod.SESSIONS_DIR, "dead-1"),
-                      {"pid": 999999, "startedAt": time.time()})
+                      {"pid": reaped_pid(), "startedAt": time.time()})
         self.assertEqual(self.mod.gc_markers(), 1)
         self.assertNotIn("dead-1", self.mod.live_sessions())
 
@@ -338,7 +342,9 @@ class LivenessTests(unittest.TestCase):
         # D2: an ssh-logout SIGTERM leaves a pidfile with a FRESH mtime; mtime alone
         # called the corpse alive for 8 minutes — exactly the window in which the user
         # reconnects and restarts claude, which used to be the only spawn opportunity.
-        self.mod.atomic_write(self.mod.PIDFILE, "999999")
+        # A reaped pid, not the constant 999999 — Linux's default pid_max (4194304) makes
+        # 999999 an ordinary, possibly-live pid there (macOS caps at 99999).
+        self.mod.atomic_write(self.mod.PIDFILE, str(reaped_pid()))
         self.assertFalse(self.mod.heartbeat_alive())
 
     def test_a_fresh_pidfile_owned_by_a_live_pid_is_alive(self):

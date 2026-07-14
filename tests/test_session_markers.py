@@ -15,7 +15,9 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_heartbeat_helpers import CLIENT, load_fresh_module, reap_daemon, wait_for  # noqa: E402
+from test_heartbeat_helpers import (  # noqa: E402
+    CLIENT, load_fresh_module, reap_daemon, reaped_pid, wait_for,
+)
 
 
 class FakeSub:
@@ -325,7 +327,9 @@ class ClaudePidTests(unittest.TestCase):
         self.assertEqual(self.mod.claude_pid(), 0)
 
     def test_a_dead_ancestor_is_refused(self):
-        self.install_ps("999999\n", "claude\n")
+        # A reaped pid, not the constant 999999 — Linux's default pid_max (4194304) makes
+        # 999999 an ordinary, possibly-live pid there (macOS caps at 99999).
+        self.install_ps(f"{reaped_pid()}\n", "claude\n")
         self.assertEqual(self.mod.claude_pid(), 0)
 
     def test_a_host_without_ps_resolves_no_pid(self):

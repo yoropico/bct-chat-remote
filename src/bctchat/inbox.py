@@ -114,7 +114,12 @@ def inbox_ack(path):
     forget(path)
 
 
-_SIDECAR_RE = re.compile(r"\.(\d+)\.(?:evict|claim|bump|tmp)$")
+_SIDECAR_RE = re.compile(r"\.(\d{1,10})\.(?:evict|claim|bump|tmp)$")
+# Digits bounded to 10: a real pid is never anywhere near that long (Linux's pid_max
+# tops out at 4194304, 7 digits), but an unbounded \d+ would match a hand-planted
+# absurd pid (e.g. "x.99999999999999999999.tmp") and hand it to int() -> os.kill(),
+# which raises OverflowError, not OSError — proc_alive()'s guard only catches OSError
+# subclasses, so that error would propagate out of the sweep instead of reading as dead.
 
 
 def _sweep_sidecars(d, now):
@@ -138,9 +143,12 @@ def _sweep_sidecars(d, now):
     closes the race, not a staleness threshold.
 
     Once the owner is confirmed dead, ORPHAN_AGE is still checked as a second,
-    independent condition, so a pid number that has since been recycled by an
-    unrelated new process can't make an otherwise-fresh sidecar look sweepable the
-    moment its original owner is gone.
+    independent condition — not as a defense against pid recycling. Recycling can't
+    cause a WRONG delete: if the pid in a sidecar's name has since been reused by a
+    new, unrelated process, proc_alive() reads it as alive and the sidecar is skipped
+    regardless of mtime, which only DELAYS cleanup (the sidecar lingers until that
+    new process is also gone), never triggers an early one. ORPHAN_AGE is just an
+    extra staleness margin applied once the owner is already confirmed dead.
 
     .evict sidecars need no further guard beyond the pid check: _evict() never
     reads one back, so a sweep that beats its forget() just makes that forget() a

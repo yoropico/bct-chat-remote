@@ -207,8 +207,13 @@ readers of this queue: no socket, no RPC.
   never be made atomic with each other — a sweep can always land in between.
   Checking the owner's liveness instead of racing the clock is what actually
   closes the race. Once the owner is confirmed dead, `ORPHAN_AGE` is still
-  checked as a second condition, so a pid recycled by an unrelated new process
-  can't make an otherwise-fresh sidecar look sweepable.
+  checked as a second, independent condition — not as a defense against pid
+  recycling, which can't cause a wrong delete: a recycled pid reads as alive
+  and only DELAYS cleanup, it never triggers an early one. Every sidecar's pid
+  is bounded to 10 digits in the sweep regex — a hand-planted absurd pid (e.g.
+  `x.99999999999999999999.tmp`) would otherwise reach `os.kill()` and raise
+  `OverflowError`, which is not an `OSError` and so is not caught by
+  `proc_alive()`'s guard, propagating out of the sweep.
 
 ## 7. Presence — the daemon is the ear
 

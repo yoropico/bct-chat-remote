@@ -9,7 +9,7 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_heartbeat_helpers import load_fresh_module  # noqa: E402
+from test_heartbeat_helpers import load_fresh_module, reaped_pid  # noqa: E402
 
 
 class InboxTests(unittest.TestCase):
@@ -209,7 +209,9 @@ class InboxTests(unittest.TestCase):
         # its mtime is, and one named with a pid nothing holds must not.
         os.makedirs(self.mod.INBOX_DIR, exist_ok=True)
         live = os.path.join(self.mod.INBOX_DIR, f"item.json.{os.getpid()}.claim")
-        dead = os.path.join(self.mod.INBOX_DIR, "item.json.999999.claim")
+        # A reaped pid, not the constant 999999 — Linux's default pid_max (4194304) makes
+        # 999999 an ordinary, possibly-live pid there (macOS caps at 99999).
+        dead = os.path.join(self.mod.INBOX_DIR, f"item.json.{reaped_pid()}.claim")
         open(live, "w").close()
         open(dead, "w").close()
         old = time.time() - self.mod.ORPHAN_AGE - 500
@@ -222,6 +224,21 @@ class InboxTests(unittest.TestCase):
                          "a live owner's sidecar must survive the sweep regardless of mtime")
         self.assertFalse(os.path.exists(dead),
                           "a dead owner's ancient sidecar must be swept")
+
+    def test_sweep_ignores_a_hand_planted_absurd_pid_without_crashing(self):
+        # An unbounded \d+ would hand a pid this large to int() -> os.kill(), which
+        # raises OverflowError (not OSError) — uncaught by proc_alive()'s guard, and
+        # propagating out of the whole sweep. The regex bounds sidecar pids to 10
+        # digits, so this name simply doesn't match and is left alone, sweep or no.
+        os.makedirs(self.mod.INBOX_DIR, exist_ok=True)
+        absurd = os.path.join(self.mod.INBOX_DIR, "item.json.99999999999999999999.tmp")
+        open(absurd, "w").close()
+        old = time.time() - self.mod.ORPHAN_AGE - 500
+        os.utime(absurd, (old, old))
+
+        self.mod.recover_orphans()          # must not raise OverflowError
+
+        self.assertTrue(os.path.exists(absurd))
 
     def test_wait_returns_as_soon_as_an_item_lands(self):
         import threading

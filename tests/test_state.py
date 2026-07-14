@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_heartbeat_helpers import load_fresh_module  # noqa: E402
+from test_heartbeat_helpers import load_fresh_module, reaped_pid  # noqa: E402
 
 
 class StateTests(unittest.TestCase):
@@ -42,8 +42,10 @@ class StateTests(unittest.TestCase):
         self.assertEqual(self.mod.load(self.mod.IDENTITY)["participantID"], "GOOD")
 
     def test_proc_alive_true_for_self_false_for_reaped_pid(self):
+        # A reaped child, not the constant 999999 — Linux's default pid_max (4194304)
+        # makes 999999 an ordinary, possibly-live pid there (macOS caps at 99999).
         self.assertTrue(self.mod.proc_alive(os.getpid()))
-        self.assertFalse(self.mod.proc_alive(999999))
+        self.assertFalse(self.mod.proc_alive(reaped_pid()))
         self.assertFalse(self.mod.proc_alive(0))
         self.assertFalse(self.mod.proc_alive(-1))
 
