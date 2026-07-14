@@ -264,5 +264,89 @@ class SessionMarkerTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.pidfile))
 
 
+class ClaudePidTests(unittest.TestCase):
+    """claude_pid() resolves the session's claude as the hook's GRANDPARENT (hooks.json's
+    `||` forces exactly one `sh -c` layer, and that shell dies with the hook). A wrong
+    answer is not symmetric: a pid that is not this session's claude makes gc_markers()
+    collect a LIVE session's marker the moment that stranger exits — live_sessions()
+    empties, the daemon exits, and nothing re-creates the marker, so that session is deaf.
+    A 0 only costs a marker that ages out on MARKER_TTL. So it must err toward 0."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.mod = load_fresh_module(self.home)
+        self.marker = os.path.join(self.home, ".bct-chat", "sessions", "sess-abc")
+
+    def tearDown(self):
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def install_ps(self, ppid_out, comm_out="", exc=None):
+        """`ps` stand-in. Answers by requested format: "ppid=" for the ancestor walk,
+        "comm=" for the plausibility check. `exc` simulates a host with no ps at all."""
+        calls = []
+
+        class FakeSub:
+            DEVNULL = -3
+
+            @staticmethod
+            def run(argv, **kwargs):
+                calls.append(argv)
+                if exc:
+                    raise exc
+                fmt = argv[argv.index("-o") + 1]
+                out = ppid_out if fmt.startswith("ppid") else comm_out
+                return type("R", (), {"stdout": out, "returncode": 0 if out else 1})()
+
+        self.mod.subprocess = FakeSub
+        return calls
+
+    def test_a_live_claude_ancestor_is_trusted(self):
+        self.install_ps(f"{os.getpid()}\n", "/usr/local/bin/node\n")
+        self.assertEqual(self.mod.claude_pid(), os.getpid())
+
+    def test_an_implausible_ancestor_is_refused(self):
+        # A short-lived wrapper is alive at the moment we ask, so "still exists" was never
+        # the safety net the docstring claimed. The command has to look like claude too.
+        self.install_ps(f"{os.getpid()}\n", "sh\n")
+        self.assertEqual(self.mod.claude_pid(), 0)
+
+    def test_a_dead_ancestor_is_refused(self):
+        self.install_ps("999999\n", "claude\n")
+        self.assertEqual(self.mod.claude_pid(), 0)
+
+    def test_a_host_without_ps_resolves_no_pid(self):
+        self.install_ps("", exc=FileNotFoundError("no ps"))
+        self.assertEqual(self.mod.claude_pid(), 0)
+
+    def test_windows_resolves_no_pid_and_never_spawns_ps(self):
+        class WindowsOs:
+            name = "nt"
+
+            def __getattr__(self, k):
+                return getattr(os, k)
+
+        calls = self.install_ps(f"{os.getpid()}\n", "node\n")
+        self.mod.os = WindowsOs()
+        try:
+            self.assertEqual(self.mod.claude_pid(), 0)
+        finally:
+            self.mod.os = os
+        self.assertEqual(calls, [], "there is no cheap ancestor walk on Windows — don't try")
+
+    def test_a_marker_with_no_resolved_pid_survives_until_its_ttl(self):
+        """Erring toward 0 is only safe because gc_markers() then falls back to the TTL. If
+        a pid-0 marker were collected on sight, claude_pid()'s own conservatism would cost
+        the session the very ear it is protecting."""
+        self.mod.claude_pid = lambda: 0
+        self.mod.mark_session("sess-abc")
+        with open(self.marker, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["pid"], 0)
+        self.assertEqual(self.mod.gc_markers(), 0)
+        self.assertIn("sess-abc", self.mod.live_sessions())
+        old = time.time() - self.mod.MARKER_TTL - 1
+        os.utime(self.marker, (old, old))
+        self.assertEqual(self.mod.gc_markers(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

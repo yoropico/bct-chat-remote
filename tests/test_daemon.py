@@ -21,6 +21,28 @@ NOT_INVITED = "이 패널은 대화방에 초대되지 않았습니다"
 NO_MENTION = "(새 멘션 없음)"
 
 
+class FakeClock:
+    """A `time` stand-in for the module's flat namespace: records every sleep and shortens
+    it, leaves the wall clock real. Patching the shared time module itself would leak into
+    the whole interpreter; the artifact is one namespace, so rebinding mod.time is enough."""
+
+    def __init__(self, on_sleep=None):
+        self.sleeps = []
+        self.on_sleep = on_sleep
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        if self.on_sleep:
+            self.on_sleep(seconds)
+        time.sleep(0.001)
+
+    def time(self):
+        return time.time()
+
+    def time_ns(self):
+        return time.time_ns()
+
+
 class DaemonTests(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
@@ -106,6 +128,134 @@ class DaemonTests(unittest.TestCase):
         self.mod.rpc = lambda *a, **k: self.fail("no RPC may be attempted with no socket")
         self.mod.do_daemon(presence_interval=0.01, listen_timeout=1)
         self.assertGreater(ticks["n"], 2, "the daemon gave up instead of waiting")
+
+    def test_a_backing_off_daemon_still_reads_as_alive(self):
+        # PIDFILE_STALE (90 s) is far shorter than BACKOFF_MAX (300 s), and the pidfile's
+        # mtime is the ONLY evidence a daemon is alive. Sleeping a whole backoff in one
+        # call therefore makes a perfectly healthy daemon — one waiting out a dead tunnel,
+        # the exact scenario this rework exists to survive — read as a corpse: every hook's
+        # ensure_daemon() then spawns a rival (Task 7 makes every hook a spawn point), and
+        # the incumbent only stands down minutes later, when it finally wakes.
+        self.mod.BACKOFF_MAX = 300
+        self.mod.atomic_write(self.mod.PIDFILE, str(os.getpid()))
+        stale = time.time() - 3600
+        os.utime(self.mod.PIDFILE, (stale, stale))
+        clock = FakeClock()
+        self.mod.time = clock
+
+        self.mod.backoff_wait(300)
+
+        self.assertTrue(clock.sleeps, "backoff_wait did not wait at all")
+        self.assertLessEqual(max(clock.sleeps), self.mod.PIDFILE_STALE / 2.0,
+                             "the backoff slept longer than PIDFILE_STALE in one call — a "
+                             "live daemon reads as dead for the rest of that sleep")
+        self.assertTrue(self.mod.heartbeat_alive(),
+                        "a daemon that is merely backing off looked dead to ensure_daemon()")
+
+    def test_a_backing_off_daemon_notices_the_last_session_leaving(self):
+        # The other side of the same coin: a daemon must not linger for up to BACKOFF_MAX
+        # after its last session is gone. Chunking the wait lets it re-check between chunks.
+        clock = FakeClock(on_sleep=lambda _s: self.mod.unmark_session("sess-1"))
+        self.mod.time = clock
+        self.mod.backoff_wait(300)
+        self.assertLessEqual(sum(clock.sleeps), self.mod.PIDFILE_STALE / 2.0,
+                             "the daemon slept out its whole backoff after its last session "
+                             "was gone instead of noticing between chunks")
+
+    def test_a_reseat_with_the_same_participant_id_seats_the_daemon(self):
+        # BCT's retire/reseat deliberately hands a re-approved external participant back the
+        # SAME participantID — that is the whole point of it: identity AND unread cursor
+        # survive a prune, so a live-but-quiet remote does not lose its backlog. So treating
+        # "identity() == dead_id" as proof we are still unseated livelocks: the approval
+        # writes that same id straight back, the gate stays true forever, ensure_membership()
+        # short-circuits on its identity fast path, and the daemon spins every JOIN_POLL —
+        # alive, seated on the server, and permanently deaf.
+        wire = {"requested": False, "approved": False}
+
+        def fake(cmd, args, pane_id="", timeout=10):
+            self.calls.append(cmd)
+            if len(self.calls) > 30:
+                self.mod.unmark_session("sess-1")   # circuit breaker: never hang the suite
+            if cmd == "chat-join":
+                wire["requested"] = True
+                return {"ok": True, "text": "REQ-1"}
+            if cmd == "chat-join-poll":
+                wire["approved"] = wire["requested"]
+                if not wire["approved"]:
+                    return {"ok": False, "error": "expired"}
+                return {"ok": True, "text": f"approved\n{IDENT}"}   # the SAME id back
+            if not wire["approved"]:
+                return {"ok": False, "error": NOT_INVITED}           # retired by the prune
+            if cmd == "chat-listen":
+                self.mod.unmark_session("sess-1")   # one good capture is all we need
+                return {"ok": True, "text": "yoros: @svr 봐줘"}
+            return {"ok": True, "text": "roster"}
+
+        self.mod.rpc = fake
+        self.mod.do_daemon(presence_interval=0, listen_timeout=1)
+        got = self.mod.inbox_claim()
+        self.assertIsNotNone(got, "the daemon never got its ear back after the reseat — it "
+                                  "livelocked on an identity the wire had already restored")
+        self.assertEqual(got[1]["text"], "yoros: @svr 봐줘")
+
+    def test_a_mention_survives_a_failed_inbox_put(self):
+        # BCT's cursor has already advanced when chat-listen returns and there is no ack
+        # verb to replay with, so a put that raises (ENOSPC, EINTR) must not lose the
+        # message: the daemon holds it and lands it at the top of the next pass, BEFORE it
+        # issues another listen.
+        real_put, fails, seen = self.mod.inbox_put, {"n": 1}, []
+
+        def flaky_put(text, name):
+            if fails["n"]:
+                fails["n"] -= 1
+                raise OSError(28, "No space left on device")
+            return real_put(text, name)
+
+        def fake(cmd, args, pane_id="", timeout=10):
+            self.calls.append(cmd)
+            if cmd != "chat-listen":
+                return {"ok": True, "text": ""}
+            seen.append(len(os.listdir(self.mod.INBOX_DIR))
+                        if os.path.isdir(self.mod.INBOX_DIR) else 0)
+            if len(seen) == 1:
+                return {"ok": True, "text": "yoros: @svr 봐줘"}
+            self.mod.unmark_session("sess-1")
+            return {"ok": True, "text": self.mod.NO_MENTION}
+
+        self.mod.inbox_put = flaky_put
+        self.mod.rpc = fake
+        self.mod.do_daemon(presence_interval=999, listen_timeout=1)
+        got = self.mod.inbox_claim()
+        self.assertIsNotNone(got, "a mention was lost to a transient inbox_put() failure")
+        self.assertEqual(got[1]["text"], "yoros: @svr 봐줘")
+        self.assertEqual(seen, [0, 1], "the retried put did not land before the next listen")
+
+    def test_a_session_marked_during_shutdown_is_handed_a_daemon(self):
+        # The empty-live_sessions() break and the pidfile release are not one atomic act: a
+        # session that marks itself in between calls ensure_daemon(), sees heartbeat_alive()
+        # (we are still alive, our pidfile still fresh), declines to spawn a second daemon —
+        # and would be left holding a marker with no ear at all.
+        spawned = []
+
+        class FakeSub:
+            DEVNULL = -3
+
+            @staticmethod
+            def Popen(argv, **kwargs):
+                spawned.append(argv)
+
+        self.mod.subprocess = FakeSub
+        self.mod.gc_markers = lambda: 0
+        seq = [[]]                                  # empty at the break; back right after
+        self.mod.live_sessions = lambda: seq.pop(0) if seq else ["sess-2"]
+        self.mod.rpc = lambda *a, **k: self.fail("a daemon with no live session must not tick")
+
+        self.mod.do_daemon(presence_interval=999, listen_timeout=1)
+
+        self.assertFalse(os.path.exists(self.mod.PIDFILE),
+                         "the dying daemon left its pidfile behind")
+        self.assertEqual(len(spawned), 1,
+                         "a session that marked itself during shutdown got no daemon")
 
     def test_presence_tick_interleaves_with_the_listen(self):
         self.scripted_rpc({"chat-listen": {"ok": True, "text": self.mod.NO_MENTION}},

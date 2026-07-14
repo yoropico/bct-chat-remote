@@ -103,22 +103,44 @@ def ensure_stable_copy():
         pass                        # best-effort; never block session start
 
 
+def ps_field(fmt, pid):
+    """One `ps -o <fmt> -p <pid>`, as a stripped string. "" for every failure — no ps on
+    this host, a timeout, or a pid that is already gone."""
+    try:
+        out = subprocess.run(["ps", "-o", fmt, "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3)
+    except Exception:
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
 def claude_pid():
     """Best-effort pid of the claude process this hook belongs to. The hook's own parent
     is the `sh -c` wrapper hooks.json needs for its `||` fallback, and that shell exits the
     moment we do — so we look one further up. POSIX only: on Windows there is no cheap
     ancestor walk, and 0 means 'no pid liveness for this marker' (gc_markers falls back to
-    MARKER_TTL there). A wrong guess would GC a LIVE session's marker, so we only trust an
-    ancestor that still exists at the moment we ask."""
+    MARKER_TTL there).
+
+    A wrong answer here is NOT symmetric, so this errs toward 0. Hand back a pid that is
+    not this session's claude and gc_markers() collects a LIVE session's marker the moment
+    that stranger exits: live_sessions() empties, the daemon exits, and nothing re-creates
+    the marker — that session is deaf for the rest of its life. Hand back 0 and the marker
+    merely ages out on MARKER_TTL (a phantom seat, nothing more).
+
+    "Still exists at the moment we ask" was never enough of a check on its own — a
+    short-lived wrapper is alive at that moment too. So the ancestor must ALSO look like
+    claude (claude/node) before we trust it; anything else is 0."""
     if os.name == "nt":
         return 0
     try:
-        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(os.getppid())],
-                             capture_output=True, text=True, timeout=3)
-        pid = int(out.stdout.strip())
-    except Exception:
+        pid = int(ps_field("ppid=", os.getppid()))
+    except ValueError:
+        return 0                        # no ps, or no such process
+    if pid <= 1 or not proc_alive(pid):
         return 0
-    return pid if pid > 1 and proc_alive(pid) else 0
+    lines = ps_field("comm=", pid).splitlines()      # a full path on macOS, argv[0] on Linux
+    comm = os.path.basename(lines[0].strip()) if lines else ""
+    return pid if CLAUDE_COMM_RE.search(comm) else 0
 
 
 def mark_session(sid):

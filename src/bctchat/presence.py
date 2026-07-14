@@ -75,8 +75,28 @@ def gc_markers():
 def backoff_wait(backoff):
     """Wait out a failed tick, then widen the window. A dead tunnel is something to wait
     for, not to die of (D1: the old two-strike suicide cost a live session its ear over an
-    8-minute blip) — but waiting must never become busy-waiting."""
-    time.sleep(backoff)
+    8-minute blip) — but waiting must never become busy-waiting.
+
+    The wait is CHUNKED, never one long sleep. The pidfile's mtime is the only evidence
+    this daemon is alive, and PIDFILE_STALE (90 s) is far shorter than BACKOFF_MAX (300 s):
+    a daemon that stops refreshing it while it waits out a dead tunnel — the exact scenario
+    this backoff exists for — reads as a corpse to heartbeat_alive(), so every hook's
+    ensure_daemon() spawns a rival (every hook is a spawn point) while the incumbent sleeps
+    on. It is alive the whole time and must keep saying so.
+
+    Re-checking live_sessions() between chunks is the other half: a daemon whose last
+    session ended mid-backoff gets out of the way now, not up to BACKOFF_MAX later."""
+    chunk = max(1.0, PIDFILE_STALE / 2.0)
+    left = backoff
+    while left > 0:
+        time.sleep(min(chunk, left))
+        left -= chunk
+        try:
+            os.utime(PIDFILE, None)
+        except OSError:
+            pass                        # vanished underneath us; the owner check catches it
+        if not live_sessions():
+            break                       # nobody left to wait for
     return min(backoff * 2, BACKOFF_MAX)
 
 
@@ -93,12 +113,23 @@ def do_daemon(presence_interval=None, listen_timeout=None):
     # not re-probe (let alone re-request) its way back into a room it is already in.
     seated = bool(identity())
     dead_id = ""                        # the identity a NOT_INVITED reply has disproven
+    unlanded = None                     # a mention heard but not yet landed (inbox_put raised)
     last_tick = time.time()
     try:
         while True:
             gc_markers()
             if not live_sessions():
-                break                   # every claude on this host is gone
+                # Nobody left to hear for. Release the pidfile HERE rather than in the
+                # finally, then look again: a session that marks itself between the check
+                # and the release calls ensure_daemon(), sees heartbeat_alive() (we are
+                # still alive, our pidfile still fresh), declines to spawn — and would be
+                # left holding a marker with no ear. Releasing first makes us the loser of
+                # that race instead of it, and we simply hand the marker on.
+                if pidfile_owner() == me:
+                    forget(PIDFILE)
+                if live_sessions():
+                    ensure_daemon()     # a no-op if one is somehow already alive
+                return
             if pidfile_owner() not in (me, 0):
                 break                   # a newer daemon took over — its file, not ours to touch
             if suspended() and not identity():
@@ -108,6 +139,14 @@ def do_daemon(presence_interval=None, listen_timeout=None):
             except OSError:
                 pass                    # vanished underneath us; the owner check catches it
             try:
+                if unlanded is not None:
+                    # A mention we heard but could not land (ENOSPC, EINTR). BCT's cursor
+                    # has ALREADY advanced past it and there is no ack verb to replay it,
+                    # so it is retried BEFORE anything else can move the cursor again: a
+                    # failed put costs a delay, never the message. A persistent failure
+                    # raises straight back into the backoff below — no hot spin.
+                    inbox_put(*unlanded)
+                    unlanded = None
                 recover_orphans()
                 if not sock_available():
                     backoff = backoff_wait(backoff)
@@ -123,17 +162,29 @@ def do_daemon(presence_interval=None, listen_timeout=None):
                     if not ensure_membership(force=bool(dead_id) and identity() == dead_id):
                         time.sleep(JOIN_POLL)      # budget spent — nothing left to ask
                         continue
-                    if not identity() or identity() == dead_id:
+                    # An identity is a reason to PROBE, never proof of a seat — and the
+                    # absence of one is the only thing that means "no seat yet". A
+                    # reseat legitimately hands back the SAME participantID (BCT retires
+                    # and re-seats an external participant deliberately, preserving its
+                    # identity AND its unread cursor across a prune), so gating on
+                    # `identity() == dead_id` here livelocked: the approval wrote that id
+                    # straight back, the gate stayed true forever, ensure_membership()
+                    # short-circuited on its identity fast path, and the daemon spun every
+                    # JOIN_POLL — alive, seated on the server, permanently deaf. The
+                    # chat-list below is the seat detector; if the wire says NOT_INVITED
+                    # again, dead_id is simply re-armed. Cost: one extra chat-list per
+                    # JOIN_POLL while an approval is pending.
+                    if not identity():
                         time.sleep(JOIN_POLL)      # a request is in flight; no seat yet
                         continue
-                    dead_id = ""
                     r = rpc("chat-list", [], identity())   # the wire, not the file, seats us
                     last_tick = time.time()
                     if not r.get("ok"):
                         if r.get("error") == NOT_INVITED:
-                            dead_id = identity()
+                            dead_id = identity()   # still dead — keep force armed for it
                         time.sleep(JOIN_POLL)
                         continue
+                    dead_id = ""                   # cleared only by a seat the wire confirms
                     seated = True
                 if time.time() - last_tick >= presence_interval:
                     r = rpc("chat-list", [], identity())   # prune defence; read-only
@@ -153,7 +204,9 @@ def do_daemon(presence_interval=None, listen_timeout=None):
                 text = r.get("text") or ""
                 if text and text not in (NO_NEW, NO_MENTION):
                     obj = load_identity() or {}
-                    inbox_put(text, obj.get("name", default_name()))   # BEFORE the next listen
+                    unlanded = (text, obj.get("name", default_name()))
+                    inbox_put(*unlanded)        # BEFORE the next listen
+                    unlanded = None             # landed; nothing to retry
                     continue                    # a busy room drains at full speed
                 # Silence. A push window is supposed to HOLD (~30s server-side); one that
                 # answers instantly is a bridge too old to hold it, and re-arming against

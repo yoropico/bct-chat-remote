@@ -168,6 +168,11 @@ writer of the inbox (§6).
   the cursor again. The silence sentinel (`NO_MENTION`/`NO_NEW`) is never an inbox
   item. A bridge that answers the window instantly instead of holding it is not
   busy-waited: the re-arm is floored at a tenth of the requested window (≤1 s).
+  For the same reason an `inbox_put()` that **raises** (ENOSPC, EINTR) does not
+  lose the mention: the daemon holds the text in memory and retries the put at the
+  top of the next pass, before it can issue another listen. A transient disk
+  failure costs a delay, not a message; a persistent one falls into the same
+  backoff as any other failed tick, so it never spins hot.
 - **Presence tick**: interleaved with the listen, a read-only `chat-list` every
   `PRESENCE_INTERVAL` (240 s) — never `chat-read`, which would consume the cursor.
   It exists because BCT prunes an external participant after 10 minutes of
@@ -181,14 +186,40 @@ writer of the inbox (§6).
   reliability is receive reliability**: the old two-strike suicide and 12-hour
   max-uptime backstop are gone, because either one silently un-ears a live
   session, and no hook is listening to notice.
-- It never deletes a pidfile it does not own (`finally:` releases it only while
-  `pidfile_owner() == os.getpid()`).
+- **The backoff wait is chunked** (`PIDFILE_STALE / 2` per chunk), refreshing the
+  pidfile's mtime on every chunk. The mtime is the only evidence a daemon is alive
+  and `PIDFILE_STALE` (90 s) is far shorter than `BACKOFF_MAX` (300 s), so a single
+  long sleep would make a perfectly healthy daemon — one waiting out a dead tunnel,
+  the very case this backoff exists for — read as **dead** to `heartbeat_alive()`.
+  Every hook's `ensure_daemon()` would then spawn a rival (every hook is a spawn
+  point), and the incumbent would only stand down minutes later when it woke. The
+  chunks also re-check `live_sessions()`, so a daemon whose last session ended
+  mid-backoff gets out of the way promptly instead of lingering for up to 5 minutes.
+- It never deletes a pidfile it does not own (`pidfile_owner() == os.getpid()` gates
+  every release). On the no-live-session exit it releases the pidfile **before**
+  re-checking the markers, and hands the room back to a fresh `ensure_daemon()` if
+  one reappeared: a session that marks itself during that shutdown sees
+  `heartbeat_alive()` still true, declines to spawn, and would otherwise be left
+  holding a marker with no ear at all.
 - **Seat**: it trusts `identity.json` until the *wire* disagrees. A `NOT_INVITED`
   reply to its listen or its tick is that disagreement, and only then does it
   re-join — through `ensure_membership(force=True)` (§8), never a bare
   `do_join()`, and with `force` scoped to the exact identity the wire disproved.
   While unseated it polls at `JOIN_POLL` (15 s) and re-probes the seat with one
   `chat-list`; a spent budget means it asks for nothing at all.
+- **Only the wire seats it.** An identity is a reason to probe, never proof of a
+  seat, and the *absence* of one is the only local fact that means "no seat yet".
+  In particular the daemon must **not** read "the id BCT gave me back is the id it
+  just disproved" as still-unseated: BCT's retire/reseat deliberately hands a
+  re-approved external participant back the **same** `participantID`, preserving
+  its identity *and* its unread cursor across a prune (that is the whole point of
+  it — a live-but-quiet remote must not lose its backlog). Gating on that livelocks:
+  the approval writes the same id straight back, the gate stays true forever,
+  `ensure_membership()` short-circuits on its identity fast path, and the daemon
+  spins every `JOIN_POLL` — alive, seated on the server, and permanently deaf. The
+  `chat-list` probe is the seat detector; if the wire answers `NOT_INVITED` again,
+  the dead identity is simply re-armed for the next `force`. Cost: one extra
+  `chat-list` per `JOIN_POLL` while an approval is pending.
 
 ### Liveness and markers
 
@@ -203,8 +234,16 @@ writer of the inbox (§6).
 - A session marker holds `{"pid", "startedAt"}`. `claude_pid()` resolves the pid
   best-effort from the *grandparent* of the hook process (`hooks.json`'s `||`
   forces an `sh -c` wrapper whose own pid dies with the hook, so `os.getppid()` is
-  useless); it is 0 on Windows, and 0 whenever the resolved ancestor is not
-  demonstrably alive at that moment.
+  useless). A wrong answer is not symmetric — a pid that is not this session's
+  claude makes `gc_markers()` collect a **live** session's marker the moment that
+  stranger exits, the daemon then exits on an empty marker set, and nothing
+  re-creates the marker, so that session is deaf for the rest of its life — while a
+  0 only costs a marker that ages out on `MARKER_TTL`. So it errs toward 0: the
+  ancestor is trusted only when `ps` says it is both alive **and** plausibly claude
+  (`comm` matching claude/node — "still exists at the moment we ask" was never a
+  safety net, since a short-lived wrapper is alive at that moment too). It is 0 on
+  Windows (no cheap ancestor walk), 0 on a host with no `ps`, and 0 for any
+  ancestor that fails either test.
 - `gc_markers()` runs at the top of every daemon pass and collects a marker whose
   pid is dead, or — where no pid could be resolved — whose mtime is older than
   `MARKER_TTL` (7 days). It errs long on purpose: a leaked marker only costs a

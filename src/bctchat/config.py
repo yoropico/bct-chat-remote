@@ -52,6 +52,10 @@ INBOX_CAP = 50              # a deeper queue means nobody has been home for a lo
 ORPHAN_AGE = 120            # a processing/ item older than this belonged to a dead hook
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+CLAUDE_COMM_RE = re.compile(r"claude|node", re.I)   # a hook ancestor plausible enough to
+                                                     # trust as this session's claude — the
+                                                     # CLI is a node program, and a marker
+                                                     # GC'd on a wrong pid costs an ear
 
 REPLY_HINT = ('당신이 멘션되었습니다 — `python3 ~/.bct-chat/bct-chat.py send "<답변>"` 으로 답하세요. '
               '(명단: `python3 ~/.bct-chat/bct-chat.py list`, 새 메시지 확인: '
