@@ -41,14 +41,39 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(self.mod.inbox_claim()[1]["text"], "first")
         self.assertEqual(self.mod.inbox_claim()[1]["text"], "second")
 
-    def test_two_claimers_never_get_the_same_item(self):
-        # Two sessions' Stop hooks fire at once. The loser's rename raises; it must
-        # take the NEXT item or none — never a duplicate of the winner's.
+    def test_claim_after_the_only_item_is_already_claimed_is_none(self):
+        # Two SEQUENTIAL claims on a one-item inbox: the second call just finds an
+        # empty inbox. This does not exercise arbitration at all — see
+        # test_inbox_claim_is_mutually_exclusive_under_thread_contention below for
+        # the real concurrency guarantee this test's old name promised.
         self.mod.inbox_put("only-one", "svr")
         a = self.mod.inbox_claim()
         b = self.mod.inbox_claim()
         self.assertIsNotNone(a)
         self.assertIsNone(b)
+
+    def test_inbox_claim_is_mutually_exclusive_under_thread_contention(self):
+        # The real regression guard for inbox_claim()'s concurrency contract: two
+        # threads released at the same instant onto the same one-item inbox. Not
+        # flaky — os.rename's exclusivity on a shared source either holds every
+        # time or the module's whole design is broken, so a single trial suffices.
+        import threading
+        self.mod.inbox_put("only-one", "svr")
+        barrier = threading.Barrier(2)
+        results = [None, None]
+
+        def worker(i):
+            barrier.wait()
+            results[i] = self.mod.inbox_claim()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len([r for r in results if r is not None]), 1)
+        self.assertEqual(len([r for r in results if r is None]), 1)
 
     def test_a_corrupt_item_is_dropped_not_returned(self):
         os.makedirs(self.mod.INBOX_DIR, exist_ok=True)
@@ -84,6 +109,47 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(texts, ["m2", "m3", "m4"])
         self.assertEqual(self.mod.take_dropped(), 2)
         self.assertEqual(self.mod.take_dropped(), 0)      # read-and-clear
+
+    def test_cap_eviction_counts_only_what_it_actually_removed(self):
+        # Force the "inbox_claim() already won the race" outcome for every eviction
+        # candidate: _evict() reports nothing was actually removed. Against a naive
+        # `_bump_dropped(excess)` (counting the cap overflow regardless of what
+        # _evict() actually removed) this would still report drops that never
+        # happened; the fix bumps by the number _evict() actually removed.
+        self.mod.INBOX_CAP = 3
+        self.mod._evict = lambda path: False
+        for i in range(5):
+            self.mod.inbox_put(f"m{i}", "svr")
+            time.sleep(0.002)
+        self.assertEqual(self.mod.take_dropped(), 0)
+
+    def test_dropped_counter_survives_a_bump_take_interleaving(self):
+        # Regression guard for the os.rename-steal design shared by _bump_dropped()
+        # and take_dropped(): a naive load()+save() bump lets a concurrent
+        # take_dropped() steal-and-clear the pre-bump value while the bump still
+        # holds a stale copy of it, so the bump's save() resurrects a value already
+        # handed to the reader — a double count. Pin the interleaving
+        # deterministically by hooking load() to fire a nested take_dropped() at
+        # the exact moment _bump_dropped() reads the value it is about to add to.
+        self.mod._bump_dropped(3)
+        taken = []
+        fired = []
+        real_load = self.mod.load
+
+        def hook(path):
+            result = real_load(path)   # captured BEFORE the nested take can act
+            if not fired:
+                fired.append(True)
+                taken.append(self.mod.take_dropped())   # the "wrong moment"
+            return result
+
+        self.mod.load = hook
+        try:
+            self.mod._bump_dropped(5)
+        finally:
+            self.mod.load = real_load
+        taken.append(self.mod.take_dropped())
+        self.assertEqual(sum(taken), 3 + 5)
 
     def test_wait_returns_as_soon_as_an_item_lands(self):
         import threading

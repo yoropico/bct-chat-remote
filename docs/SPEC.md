@@ -122,12 +122,14 @@ readers of this queue: no socket, no RPC.
 - **Cap**: `INBOX_CAP` (50) items. A `put` past the cap evicts the oldest first,
   counting what it dropped in `dropped.json`, read-and-cleared by
   `take_dropped()`. Eviction claims its victim by the same `os.rename`
-  arbitration `inbox_claim()` uses, not a bare `os.remove` — measured on at
-  least one real filesystem, a concurrent rename-away and remove of the same
-  file can *both* report success, which would double-count an item that was
-  actually delivered as also dropped. `take_dropped()` and the daemon's own
-  counter bump race each other the same way, by the same primitive, so neither
-  a concurrent reader nor a concurrent bump can lose or double-report a count.
+  arbitration `inbox_claim()` uses, not a bare `os.remove`: eviction must count
+  only the files it actually removed, which requires eviction and claim to
+  compete through the same primitive so that losing is observable — a bare
+  `os.remove`'s failure is silently swallowed, which is exactly how a naive
+  version double-counts an item that `inbox_claim()` already delivered as also
+  dropped. `take_dropped()` and the daemon's own counter bump race each other
+  the same way, by the same primitive, so neither a concurrent reader nor a
+  concurrent bump can lose or double-report a count.
 
 ## 7. Presence
 
