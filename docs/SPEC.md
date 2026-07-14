@@ -1,0 +1,111 @@
+# SPEC — bct-chat-remote (the client contract)
+
+What this plugin promises. Behaviour lives here; rationale lives in
+`docs/superpowers/specs/`, and history in `CHANGELOG.md`.
+
+Scope: the client half only. BCT (the Swift app that hosts the room) ships from
+its own repo; this document never redefines its wire protocol.
+
+## 1. Shipping contract
+
+- `scripts/bct-chat.py` is a **single file, pure stdlib, python3**. It runs on an
+  unmanaged remote with no venv and no install step: `scp scripts/bct-chat.py
+  <host>:` is a supported deployment.
+- It is **generated** from `src/bctchat/*.py` by `python3 scripts/build.py`, and
+  the generated artifact is committed. `tests/test_build.py` fails if the two
+  drift.
+- The artifact is a flat concatenation in **one namespace** — not a package. Its
+  module globals are the monkeypatch surface the test suite relies on.
+- On any run it keeps a canonical copy at `~/.bct-chat/bct-chat.py` (the path the
+  skill prose and `REPLY_HINT` tell claude to invoke), and it re-execs that same
+  file to spawn its daemon.
+
+## 2. State
+
+All under `~/.bct-chat/` (override the whole directory with `$BCT_CHAT_HOME`):
+
+| Path | Meaning |
+|---|---|
+| `identity.json` | `{"participantID", "name"}` — our seat in the room |
+| `pending-join.json` | an outstanding join request |
+| `join-cooldown.json` | when an automatic re-request is next allowed |
+| `sessions/<session-id>` | one marker per live claude session on this host (the daemon's refcount) |
+| `heartbeat.pid` | the presence daemon's pidfile; its mtime is the liveness signal |
+| `bct-chat.py` | the stable copy |
+
+## 3. Transport
+
+`$BCT_CHAT_SOCK` (default `~/.bct-chat.sock`, the ssh-`RemoteForward`ed BCT
+control socket). `tcp:<host>:<port>` selects TCP — the supported transport on
+Windows, where CPython has no AF_UNIX. Wire: one line of JSON in
+(`{"paneID","cmd","args"}`), one line of JSON out (`{"ok","text","error"}`).
+
+## 4. Verbs
+
+| Verb | Behaviour |
+|---|---|
+| `join [name]` | request a seat; blocks up to 5 min for the user's approval in BCT's chat dock. Manual intent overrides any cooldown. |
+| `leave` | leave the room and drop the identity |
+| `send <msg>` | post to the room |
+| `read` | print unseen messages (advances the server-side cursor) |
+| `list` | the roster |
+| `wait [--timeout N]` | poll until a new message arrives |
+| `listen` | hold one server-push `chat-listen` window (~30 s server-side) |
+| `heartbeat` | the presence daemon (spawned automatically; not for humans) |
+| `session-start`, `session-end`, `stop-hook`, `prompt-submit` | the Claude Code hook verbs |
+
+## 5. Hook behaviour
+
+The four hook verbs are wired in `hooks/hooks.json`.
+
+- **Invariant: a hook verb always exits 0.** `hooks.json` falls back from
+  `python3` to `python` on ANY nonzero exit, and that re-run would see stdin
+  already drained — no session id, no marker, no daemon, and a duplicate join
+  banner. Every hook swallows `Exception` and `SystemExit` alike.
+- **Invariant: a hook is silent unless it has something to deliver.** A broken
+  tunnel must never disturb a turn.
+- Inside a BCT pane (`$BCT_PANE_ID` set) every hook verb is a no-op — BCT's
+  native chat injection owns delivery there.
+- `session-start`: keep the stable copy current, mark this session live, and make
+  sure the host is in the room and a daemon is running.
+- `session-end`: drop this session's marker. The daemon is not killed — another
+  session on this host may still be in the room.
+- `stop-hook`: when the room has mentioned us, block the finishing turn with the
+  digest so claude answers the room in place.
+- `prompt-submit`: same detection, but the digest rides along as context with the
+  user's next prompt — this is what reaches a session that was idle.
+
+## 6. Presence
+
+One daemon per host. It exists because BCT prunes an external participant after
+10 minutes of silence, so a live-but-quiet host must keep proving it is there.
+
+- Spawned by `session-start`, detached, single-instance via `heartbeat.pid`.
+- Ticks every 240 s with a read-only `chat-list` (never `chat-read` — that would
+  consume the cursor).
+- Exits when no session marker is left on this host, when a newer daemon owns the
+  pidfile, after two consecutive failed ticks, or after 12 h.
+- It never deletes a pidfile it does not own.
+
+## 7. Membership
+
+- The identity outlives a BCT restart, but BCT's memory of it does not — so
+  membership is probed on the wire (`chat-list`), never trusted from the file.
+- An automatic re-request is rate-limited by a 30-minute cooldown. A session
+  restart drops a cooldown armed by an *expiry* (fresh intent re-requests) but
+  never one armed by an explicit *denial* (no re-nag).
+- A `NOT_INVITED` reply to a user verb triggers one blocking re-join, then the
+  verb is retried.
+
+## 8. Delivery format
+
+The digest mirrors BCT's local chat injection: an identity line
+(`[bct-chat] 단체 채팅방 — 당신은 @<name> 입니다. 새 메시지:`), the room lines exactly
+as BCT returned them, then `REPLY_HINT` — the instruction telling claude to answer
+with `python3 ~/.bct-chat/bct-chat.py send "<답변>"`.
+
+## 9. Platforms
+
+macOS, Linux (AF_UNIX) and Windows (`tcp:`). Nothing may call `os.kill(pid, 0)` on
+Windows: CPython maps `os.kill` to `TerminateProcess` there for any signal, so
+probing a process would kill it.
