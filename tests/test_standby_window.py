@@ -23,6 +23,7 @@ class StandbyWindowTests(unittest.TestCase):
         self.mod.save(self.mod.IDENTITY, {"participantID": IDENT, "name": "svr"})
         self.mod.sock_available = lambda: True
         self.mod.drain_stdin = lambda: None
+        self.rpc_timeouts = {}
         os.environ.pop("BCT_PANE_ID", None)
         os.environ.pop("BCT_CHAT_STANDBY", None)
 
@@ -39,6 +40,7 @@ class StandbyWindowTests(unittest.TestCase):
         calls = []
         def fake(cmd, args, pane_id="", timeout=10):
             calls.append(cmd)
+            self.rpc_timeouts[cmd] = timeout
             return responses[cmd]
         self.mod.rpc = fake
         return calls
@@ -60,6 +62,7 @@ class StandbyWindowTests(unittest.TestCase):
         self.assertIn("당신은 @svr", obj["reason"])
         self.assertIn("yoros: @svr 대기중이야?", obj["reason"])
         self.assertIn("chat-listen", calls)
+        self.assertEqual(self.rpc_timeouts["chat-listen"], 40)
 
     def test_idle_window_sentinel_is_silent(self):
         self.rpc_map({"chat-peek": {"ok": True, "text": "0 0"},
