@@ -73,3 +73,17 @@
   real remote session run from the cache, not the stable copy, so real sessions stay on 1.3.0 until the
   plugin is updated on the remote (the stable-copy vs plugin-cache gotcha). Stable copy + manual verbs +
   the skill already use 2.0.0.
+2026-07-15 | DEPLOYED 2.0.0 to rsbglee — both halves of the stable-copy/plugin-cache split.
+  The remote installs bct-chat-remote from a DIRECTORY-source marketplace (C:\Users\bglee\.bct-chat\plugin),
+  not GitHub — so the deploy is: (1) stable copy scp'd to ~/.bct-chat/bct-chat.py (used by manual verbs +
+  the skill; this is what all the live tests ran against), and (2) the plugin-source directory replaced
+  with a clean 2.0.0 tar (git archive HEAD -> tar -x on the remote, contents cleared first to drop the
+  rework's deleted test files), then `claude plugin marketplace update bct-chat-remote` +
+  `claude plugin update bct-chat-remote@bct-chat-remote` (the plain name 404s; the plugin@marketplace form
+  is required). Cache now holds 2.0.0 (plugin.json 2.0.0, artifact 61796 bytes with inbox_put, stop-hook
+  timeout 960) alongside 1.1.0..1.3.0. "Restart to apply" — the remote's NEXT claude session runs the 2.0.0
+  hooks; until then a running session stays on 1.3.0. Also aligned marketplace.json metadata.version
+  1.6.1->2.0.0 (PR#9) — Task 10 had bumped only plugin.json, and marketplace.json is outside the spec-gate.
+  Fixes that landed after the main rework merge (all live/CI-found): stale-identity-as-approval (PR#8,
+  found driving the live remote), Windows CI portability incl. the inbox filename-collision message-loss
+  (in PR#7), and the same-pid thread-claim test that only modelled a degenerate case (PR#8 follow-up).
