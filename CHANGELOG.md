@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.1
+
+Upgrade fix — a new-version session displaces the old-version daemon instead of
+going deaf behind it.
+
+- **The presence daemon is now version-stamped.** A rolling upgrade (e.g. 1.6.x →
+  2.0.x, where the receive model changed from hook-polling to a daemon-fed inbox)
+  could leave the *old* daemon running: it kept `heartbeat.pid` fresh and its pid
+  alive, so `heartbeat_alive()` reported the ear was up and every hook's
+  `ensure_daemon()` declined to spawn the new-version daemon — which was the only
+  thing that feeds the new inbox. The host stayed "connected" (the old daemon held
+  presence) but never delivered a mention (the new inbox was never fed). Now the
+  daemon writes its `ARTIFACT` path to a `heartbeat.artifact` sidecar, and
+  `heartbeat_alive()` counts a daemon as the current ear only when it is stamped
+  with *this* version; an unstamped or differently-stamped pidfile is displaced.
+  `heartbeat.pid` stays a bare int, so a pre-stamp daemon still stands down cleanly
+  the moment the new daemon takes the pidfile.
+
 ## 2.0.0
 
 Receive rework — the daemon is now the ear, and a mention is never lost.

@@ -140,7 +140,8 @@ class DaemonTests(unittest.TestCase):
         # the incumbent only stands down minutes later, when it finally wakes.
         self.mod.BACKOFF_MAX = 300
         self.mod.atomic_write(self.mod.PIDFILE, str(os.getpid()))
-        stale = time.time() - 3600
+        self.mod.atomic_write(self.mod.DAEMON_ARTIFACT, self.mod.ARTIFACT)   # a real daemon
+        stale = time.time() - 3600                                           # stamps its version
         os.utime(self.mod.PIDFILE, (stale, stale))
         clock = FakeClock()
         self.mod.time = clock
@@ -163,6 +164,31 @@ class DaemonTests(unittest.TestCase):
         self.assertLessEqual(sum(clock.sleeps), self.mod.PIDFILE_STALE / 2.0,
                              "the daemon slept out its whole backoff after its last session "
                              "was gone instead of noticing between chunks")
+
+    def test_do_daemon_stamps_its_artifact_when_it_takes_the_pidfile(self):
+        # The stamp is what lets a newer-version hook tell this daemon apart from a stale one.
+        # It must be beside the pid the moment the daemon is live, i.e. by the first RPC.
+        seen = {}
+
+        def fake(cmd, args, pane_id="", timeout=10):
+            self.calls.append(cmd)
+            seen.setdefault("artifact", self.mod.pidfile_artifact())
+            self.mod.unmark_session("sess-1")
+            return {"ok": True, "text": self.mod.NO_MENTION}
+
+        self.mod.rpc = fake
+        self.mod.do_daemon(presence_interval=999, listen_timeout=1)
+        self.assertEqual(seen.get("artifact"), self.mod.ARTIFACT,
+                         "the daemon took the pidfile without stamping its artifact")
+
+    def test_do_daemon_clears_its_artifact_stamp_on_exit(self):
+        # The stamp is released with the pidfile it belongs to — a leaked stamp beside a
+        # released pidfile would misidentify the NEXT daemon that reuses the file.
+        self.scripted_rpc({"chat-listen": {"ok": True, "text": self.mod.NO_MENTION}},
+                          stop_after=1)
+        self.mod.do_daemon(presence_interval=999, listen_timeout=1)
+        self.assertFalse(os.path.exists(self.mod.DAEMON_ARTIFACT),
+                         "the exiting daemon left its artifact stamp behind")
 
     def test_a_reseat_with_the_same_participant_id_seats_the_daemon(self):
         # BCT's retire/reseat deliberately hands a re-approved external participant back the
@@ -380,6 +406,7 @@ class LivenessTests(unittest.TestCase):
 
     def test_a_fresh_pidfile_owned_by_a_live_pid_is_alive(self):
         self.mod.atomic_write(self.mod.PIDFILE, str(os.getpid()))
+        self.mod.atomic_write(self.mod.DAEMON_ARTIFACT, self.mod.ARTIFACT)   # this version's ear
         self.assertTrue(self.mod.heartbeat_alive())
 
     def test_a_stale_pidfile_is_not_alive(self):
@@ -387,6 +414,53 @@ class LivenessTests(unittest.TestCase):
         old = time.time() - self.mod.PIDFILE_STALE - 1
         os.utime(self.mod.PIDFILE, (old, old))
         self.assertFalse(self.mod.heartbeat_alive())
+
+    def test_a_live_daemon_running_my_artifact_is_my_ear(self):
+        # A same-version daemon stamps THIS artifact beside its pid; that is the ear.
+        self.mod.atomic_write(self.mod.PIDFILE, str(os.getpid()))
+        self.mod.atomic_write(self.mod.DAEMON_ARTIFACT, self.mod.ARTIFACT)
+        self.assertTrue(self.mod.heartbeat_alive())
+
+    def test_a_live_daemon_from_a_different_artifact_is_not_my_ear(self):
+        # The rolling-upgrade bug: a daemon from a DIFFERENT plugin version holds the
+        # pidfile. The receive path changed with the version — a pre-inbox presence daemon
+        # keeps a fresh, live pidfile but never feeds this version's inbox — so a hook that
+        # defers to it (heartbeat_alive() True) leaves the session permanently deaf.
+        self.mod.atomic_write(self.mod.PIDFILE, str(os.getpid()))
+        self.mod.atomic_write(self.mod.DAEMON_ARTIFACT,
+                              "/plugins/cache/bct-chat-remote/1.6.1/scripts/bct-chat.py")
+        self.assertFalse(self.mod.heartbeat_alive())
+
+    def test_a_live_daemon_with_no_artifact_stamp_is_not_my_ear(self):
+        # A pre-stamp daemon (1.6.x, or the 2.0.x that shipped the inbox before this stamp)
+        # wrote only the bare pid. An unstamped-but-live pidfile is exactly the daemon this
+        # fix must displace, so it must NOT read as the current ear — otherwise the stale
+        # daemon keeps blocking the spawn, which is the bug.
+        self.mod.atomic_write(self.mod.PIDFILE, str(os.getpid()))   # no sidecar
+        self.assertFalse(self.mod.heartbeat_alive())
+
+    def test_ensure_daemon_displaces_a_different_version_daemon(self):
+        # The core regression: an OLD-version daemon holding a fresh, live pidfile used to
+        # make ensure_daemon() defer, so the new-version session never got its inbox-feeding
+        # ear. Now it spawns; the new daemon takes the pidfile and the old one stands down
+        # on its next pidfile_owner() check (the pidfile stays a bare int for exactly that).
+        self.mod.atomic_write(self.mod.PIDFILE, str(os.getpid()))
+        self.mod.atomic_write(self.mod.DAEMON_ARTIFACT,
+                              "/plugins/cache/bct-chat-remote/1.6.1/scripts/bct-chat.py")
+        spawned = []
+
+        class FakeSub:
+            DEVNULL = -3
+
+            @staticmethod
+            def Popen(argv, **kwargs):
+                spawned.append(argv)
+
+        self.mod.subprocess = FakeSub
+        self.mod.ensure_daemon()
+        self.assertEqual(len(spawned), 1,
+                         "a stale-version daemon blocked the new ear from spawning")
+        self.assertIn("daemon", spawned[0])
 
     def test_ensure_daemon_refuses_while_suspended_and_unseated(self):
         self.mod.save(self.mod.JOIN_STATE, {"attempts": 3, "nextAttemptAt": 0,
@@ -414,6 +488,7 @@ class LivenessTests(unittest.TestCase):
 
     def test_ensure_daemon_refuses_while_a_live_daemon_holds_the_pidfile(self):
         self.mod.atomic_write(self.mod.PIDFILE, str(os.getpid()))   # fresh AND alive
+        self.mod.atomic_write(self.mod.DAEMON_ARTIFACT, self.mod.ARTIFACT)   # ...and MY version
         spawned = []
 
         class FakeSub:

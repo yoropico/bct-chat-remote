@@ -87,3 +87,27 @@
   Fixes that landed after the main rework merge (all live/CI-found): stale-identity-as-approval (PR#8,
   found driving the live remote), Windows CI portability incl. the inbox filename-collision message-loss
   (in PR#7), and the same-pid thread-claim test that only modelled a degenerate case (PR#8 follow-up).
+
+## 2.0.1 — version-stamp the presence daemon so an upgrade displaces the old one
+
+Live incident on rsbglee-ad (Windows): 회사PC showed "connected" but never answered a
+mention. Diagnosed to a rolling-upgrade race: the 2.0.0 plugin was installed while the OLD
+1.6.1 presence daemon (PID 10892) was still running. 2.0.0 moved reception into a daemon-fed
+inbox, but ensure_daemon() saw the 1.6.1 daemon's fresh, live pidfile (shared heartbeat.pid
+path) and reported heartbeat_alive()=True, so it never spawned the 2.0.0 ear. The inbox stayed
+empty (proven live: chat-peek returned "1 1" while INBOX_DIR was []), so every stop_hook
+inbox_claim() returned None. Presence (old daemon) held the seat; reception (new daemon) never
+started. Immediate remote fix: taskkill the 1.6.1 daemon + rm heartbeat.pid + spawn the 2.0.0
+daemon; re-seated after a mid-debug BCT restart reset the room.
+
+Root fix (this change): heartbeat_alive() is now version-scoped. do_daemon() stamps its ARTIFACT
+into a heartbeat.artifact sidecar when it claims the pidfile (released with it on both exit
+paths). heartbeat_alive() counts a daemon as the current ear only when mtime-fresh AND
+proc_alive AND pidfile_artifact()==ARTIFACT; an unstamped (pre-fix / 1.6.x) or differently-
+stamped pidfile now reads as displaceable, so ensure_daemon() spawns the current-version daemon,
+which takes the pidfile and the old one stands down on its next pidfile_owner() check. Kept
+heartbeat.pid a bare int (sidecar, not folded in) so the already-deployed 2.0.0 daemon's own
+int-parsing pidfile_owner()/loop-exit still work and it exits cleanly on takeover — i.e. this
+fix will displace the CURRENT 2.0.0 daemon on rsbglee when 2.0.1 ships. TDD: 6 new tests in
+test_daemon.py (4 liveness/ensure_daemon, 2 do_daemon stamp/clear), 3 existing daemon-liveness
+tests updated to stamp their simulated daemon. Full suite 154 green. SPEC + CHANGELOG updated.

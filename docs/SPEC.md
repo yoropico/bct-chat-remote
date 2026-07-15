@@ -30,7 +30,8 @@ All under `~/.bct-chat/` (override the whole directory with `$BCT_CHAT_HOME`):
 | `pending-join.json` | an outstanding join request; discarded once older than `PENDING_TTL` |
 | `join-state.json` | `{"attempts", "nextAttemptAt", "suspended", "lastOutcome"}` — the join budget |
 | `sessions/<session-id>` | `{"pid", "startedAt"}` — one marker per live claude session on this host (the daemon's refcount) |
-| `heartbeat.pid` | the presence daemon's pidfile; it holds the daemon's pid and its mtime is the liveness signal |
+| `heartbeat.pid` | the presence daemon's pidfile; it holds the daemon's pid (a bare int) and its mtime is the liveness signal |
+| `heartbeat.artifact` | the `ARTIFACT` path the pidfile's owner runs — a version stamp beside the pid, so a hook from a newer plugin version can tell the current ear apart from a stale-version daemon and displace it |
 | `bct-chat.py` | the stable copy |
 | `inbox/<time_ns>-<pid>.json` | a captured mention, not yet claimed by a hook |
 | `processing/<pid>-<time_ns>-<pid>.json` | a mention claimed by a hook, not yet acked |
@@ -262,6 +263,19 @@ writer of the inbox (§6).
   one reappeared: a session that marks itself during that shutdown sees
   `heartbeat_alive()` still true, declines to spawn, and would otherwise be left
   holding a marker with no ear at all.
+- **Liveness is version-scoped.** `heartbeat_alive()` counts a daemon as the current
+  ear only when three things hold: the pidfile mtime is fresh, its owner pid is a live
+  process, *and* the daemon is stamped with **this** `ARTIFACT` (`heartbeat.artifact`
+  names the version it runs). A rolling upgrade can leave the previous version's daemon
+  running — it keeps the pidfile fresh and its pid alive, but its receive path is not
+  this version's (a pre-inbox presence daemon never feeds this inbox). Without the
+  version leg, every hook `ensure_daemon()` would defer to that stale daemon and the
+  session would stay deaf. With it, an unstamped or differently-stamped pidfile reads as
+  **not the current ear**, so `ensure_daemon()` spawns the new daemon; it takes the
+  pidfile, and the old daemon stands down on its next `pidfile_owner()` check. The stamp
+  is a *sidecar*, never folded into `heartbeat.pid`: the pidfile stays a bare int so a
+  pre-stamp daemon's own `pidfile_owner()` still parses it and exits cleanly on takeover.
+  The stamp is written when the daemon claims the pidfile and released with it.
 - **Seat**: it trusts `identity.json` until the *wire* disagrees. A `NOT_INVITED`
   reply to its listen or its tick is that disagreement, and only then does it
   re-join — through `ensure_membership(force=True)` (§8), never a bare
