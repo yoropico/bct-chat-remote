@@ -14,16 +14,34 @@ def pidfile_owner():
         return 0
 
 
+def pidfile_artifact():
+    """The ARTIFACT the pidfile's owner is running, or "" when unknown — an unstamped
+    pidfile (a pre-stamp daemon: 1.6.x, or the 2.0.x that shipped the inbox before this
+    sidecar). "" deliberately does NOT match any real ARTIFACT, so an unstamped daemon
+    reads as "not the current version" and is displaced rather than deferred to."""
+    try:
+        with open(DAEMON_ARTIFACT, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def heartbeat_alive():
-    """mtime AND a real liveness probe. mtime alone called a signal-killed daemon alive for
-    8 minutes (D2) — its pidfile keeps a fresh mtime, and nothing respawns a corpse that
-    still looks warm."""
+    """mtime AND a real liveness probe AND a version match. mtime alone called a
+    signal-killed daemon alive for 8 minutes (D2) — its pidfile keeps a fresh mtime, and
+    nothing respawns a corpse that still looks warm. The version match is the third leg: a
+    daemon from a DIFFERENT plugin version can hold a fresh, live pidfile yet run a receive
+    path that is not this one (a rolling upgrade left the old presence daemon running; it
+    never feeds this version's inbox), so treating it as "the ear is up" leaves every hook
+    that defers to it permanently deaf. Only a daemon stamped with THIS ARTIFACT counts."""
     try:
         if time.time() - os.stat(PIDFILE).st_mtime >= PIDFILE_STALE:
             return False
     except OSError:
         return False
-    return proc_alive(pidfile_owner())
+    if not proc_alive(pidfile_owner()):
+        return False
+    return pidfile_artifact() == ARTIFACT
 
 
 def ensure_daemon():
@@ -112,6 +130,8 @@ def do_daemon(presence_interval=None, listen_timeout=None):
         return                          # another daemon has it
     me = os.getpid()
     atomic_write(PIDFILE, str(me))
+    atomic_write(DAEMON_ARTIFACT, ARTIFACT)   # stamp the version beside the pid so a newer
+                                              # hook can tell this ear apart from a stale one
     backoff = BACKOFF_MIN
     # Trust identity.json until the WIRE disagrees: a daemon restart with a valid seat must
     # not re-probe (let alone re-request) its way back into a room it is already in.
@@ -131,6 +151,7 @@ def do_daemon(presence_interval=None, listen_timeout=None):
                 # that race instead of it, and we simply hand the marker on.
                 if pidfile_owner() == me:
                     forget(PIDFILE)
+                    forget(DAEMON_ARTIFACT)   # the stamp is released with the pid it names
                 if live_sessions():
                     ensure_daemon()     # a no-op if one is somehow already alive
                 return
@@ -229,3 +250,4 @@ def do_daemon(presence_interval=None, listen_timeout=None):
     finally:
         if pidfile_owner() == me:
             forget(PIDFILE)             # only ever release a pidfile we still own
+            forget(DAEMON_ARTIFACT)     # ...and the version stamp that belongs to it

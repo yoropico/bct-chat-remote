@@ -36,6 +36,15 @@ MARKER_TTL = 7 * 86400          # a marker with no pid to probe (Windows) ages o
                                  # GC'ing a LIVE session's marker costs it its ear, while a
                                  # leaked one only costs a phantom seat — so err long
 PIDFILE = os.path.join(STATE_DIR, "heartbeat.pid")
+DAEMON_ARTIFACT = os.path.join(STATE_DIR, "heartbeat.artifact")   # the ARTIFACT the pidfile's
+                                 # owner runs — a version stamp beside the pid, so a hook from a
+                                 # NEWER plugin version can tell "the current ear is up" apart
+                                 # from "a stale-version daemon holds the pidfile" and displace
+                                 # the latter (a rolling upgrade left it running; its receive
+                                 # path is not this version's, so deferring to it goes deaf).
+                                 # A SIDECAR, not the pidfile itself: PIDFILE stays a bare int so
+                                 # a pre-stamp daemon's own pidfile_owner()/loop-exit still parse
+                                 # it and stand down cleanly the moment the new daemon takes over.
 PIDFILE_STALE = 90              # pidfile mtime older than this = no daemon (with proc_alive)
 PRESENCE_INTERVAL = 240         # 4 min — comfortably inside BCT's 10-min prune window
 LISTEN_TIMEOUT = 40             # BCT holds chat-listen ~30s; 40 covers the hold plus slack
