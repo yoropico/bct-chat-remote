@@ -52,33 +52,47 @@ class InboxTests(unittest.TestCase):
         self.assertIsNotNone(a)
         self.assertIsNone(b)
 
-    def test_inbox_claim_is_mutually_exclusive_under_thread_contention(self):
-        # Two threads in ONE process, released at the same instant onto the same
-        # one-item inbox, pin the loser's arbitration path: os.rename raises for
-        # whichever thread loses the race, and it correctly walks away with None.
-        # CPython releases the GIL around the rename(2) syscall itself, so these two
-        # threads' renames really do reach the kernel concurrently, arbitrated by
-        # the same VFS directory lock a cross-process race would hit — this is a
-        # real and worthwhile contract. It is still not a full stand-in for the
-        # cross-PROCESS case the module's design ultimately rests on, though: the
-        # two threads here share one process's fd table and cwd, which two
-        # independent hook processes never do. Not flaky — os.rename's exclusivity
-        # on a shared source either holds every time or the module's whole design is
-        # broken, so a single trial suffices.
+    def test_inbox_claim_is_mutually_exclusive_across_processes(self):
+        # The real contract: two INDEPENDENT hook processes, released at the same instant
+        # onto the same one-item inbox, and exactly one delivers it. What makes that safe is
+        # not shared thread state — it is that each process renames the item into a
+        # pid-qualified destination (processing/<pid>-<name>) off the SAME source, and once
+        # the winner consumes that source the loser's rename fails, so it walks away with None.
+        #
+        # Two threads sharing one os.getpid() do NOT model this — they compute the SAME
+        # destination, and os.rename's same-source/same-dest behaviour differs by platform
+        # (Windows can let both appear to win, POSIX serialises them). That degenerate case
+        # never occurs in production, where every claimer is a distinct pid. So give each
+        # thread its own pid and the arbitration reduces to exactly what two processes see.
         import threading
+        pids = {}
+        real_os = self.mod.os
+
+        class OsPerThread:
+            def __getattr__(self, n):
+                return getattr(real_os, n)
+
+            def getpid(self):
+                return pids.get(threading.get_ident(), real_os.getpid())
+
         self.mod.inbox_put("only-one", "svr")
         barrier = threading.Barrier(2)
         results = [None, None]
 
         def worker(i):
+            pids[threading.get_ident()] = 90000 + i     # a distinct pid per claimer
             barrier.wait()
             results[i] = self.mod.inbox_claim()
 
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        self.mod.os = OsPerThread()
+        try:
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            self.mod.os = real_os
 
         self.assertEqual(len([r for r in results if r is not None]), 1)
         self.assertEqual(len([r for r in results if r is None]), 1)
