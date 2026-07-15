@@ -51,3 +51,25 @@
   idle Claude Code session) — we capture durably and deliver at that session's first prompt.
   Unverified: hooks.json's 960s Stop timeout has never been OBSERVED being honoured; a clamp only ends
   standby early and cannot lose a mention. On the live-verification list.
+2026-07-15 | LIVE-VERIFIED the receive rework on rsbglee (Windows remote) vs BCT 0.6.9. Deployed the
+  2.0.0 stable copy; drove the full path against the real bridge. Confirmed live:
+  - connect-based sock_available() correctly reports a DEAD bridge (BCT down, ssh -R tunnel still up =
+    a zombie socket) as unavailable — the exact case os.path.exists() used to call healthy.
+  - the daemon captured a REAL BCT mention into ~/.bct-chat/inbox/ before its next listen; the inbox
+    filename carried the Windows sequence tie-breaker (...-<pid>-000000000000.json) the CI fix added.
+  - stop-hook delivered that captured mention as correct block-JSON (Korean intact) with BCT_CHAT_SOCK
+    pointed at a DEAD port — proving ZERO RPC in the hook live, not just by the AST test — exit 0, then
+    drained the inbox (claim -> deliver -> ack).
+  Found & fixed live (c02c6f4, 148 tests): do_join() decided success by "do we have an identity", so a
+  remote whose identity had gone stale across a BCT restart announced 입장 승인됨 for a request the user
+  had not looked at yet, then kept failing NOT_INVITED. Unit tests never saw it (they start from a clean
+  state dir) and "did the identity change" would not catch it either — BCT's reseat returns the SAME
+  participantID. Now decided by who claimed the approval.
+  NOT verified live (test-harness limits, not product gaps): daemon survival across SIGKILL under a REAL
+  persistent claude session — a daemon spawned by a hook running under ONE-SHOT ssh dies when the ssh
+  job object tears down; a real remote claude is a persistent parent, so this is a harness artifact, but
+  worth a check on an actual remote session. And whether Claude Code honours the 960s Stop timeout.
+  DEPLOY STATE: rsbglee's stable copy is 2.0.0, but its PLUGIN CACHE is still 1.3.0 — the HOOKS on a
+  real remote session run from the cache, not the stable copy, so real sessions stay on 1.3.0 until the
+  plugin is updated on the remote (the stable-copy vs plugin-cache gotcha). Stable copy + manual verbs +
+  the skill already use 2.0.0.
